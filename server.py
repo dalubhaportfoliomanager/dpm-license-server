@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
-"""Dalubha Portfolio Manager central license activation tracker (stdlib only)."""
+"""Dalubha Portfolio Manager central license/account tracker (SQLite or PostgreSQL)."""
 from __future__ import annotations
-import json, os, re, sqlite3
-
-try:
-    import psycopg
-    from psycopg.rows import dict_row
-except ImportError:
-    psycopg = None
-    dict_row = None
+import json, os, re, sqlite3, hashlib, secrets, hmac
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 ISSUER_SALT="DPM-2026-LICENSE-V1"
-DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
+DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
 HOST=os.environ.get("DPM_LICENSE_SERVER_HOST","0.0.0.0")
 PORT=int(os.environ.get("PORT", os.environ.get("DPM_LICENSE_SERVER_PORT","9191")))
 MAX_ACTIVATIONS=3
-ADMIN_RESET_TOKEN=os.environ.get("DPM_LICENSE_ADMIN_TOKEN","DALUBHA-ADMIN-RESET-2026")
+ADMIN_RESET_TOKEN=os.environ.get("DPM_LICENSE_ADMIN_TOKEN","")
 # License Management Pro is the authoritative license database.
 # DPM and License Management Pro are sibling project folders.
 _DEFAULT_LMP_DB_PATH=os.path.abspath(os.path.join(
@@ -159,30 +152,39 @@ def decode_serial(serial):
     return {"serial":serial,"client_code":client,"expiry_date":expiry.strftime("%Y-%m-%d"),"license_count":count,"expiry_epoch":expiry.timestamp()}
 
 class _PostgresConnection:
-    """Small adapter so existing server SQL can use SQLite-style ? placeholders."""
-    def __init__(self, conn):
-        self._conn = conn
-
+    """Small compatibility adapter so existing SQL can use ? placeholders."""
+    def __init__(self, raw):
+        self.raw = raw
     def execute(self, sql, params=()):
-        sql = sql.replace("?", "%s")
-        return self._conn.execute(sql, params)
+        sql = sql.replace("BEGIN IMMEDIATE", "BEGIN").replace("?", "%s")
+        return self.raw.execute(sql, params)
+    def commit(self): return self.raw.commit()
+    def rollback(self): return self.raw.rollback()
+    def close(self): return self.raw.close()
 
-    def commit(self):
-        return self._conn.commit()
-
-    def close(self):
-        return self._conn.close()
+def get_client_account_count(conn):
+    """Return COUNT(*) correctly for both SQLite rows and psycopg dict rows."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS account_count FROM client_accounts"
+    ).fetchone()
+    if isinstance(row, dict):
+        return int(row["account_count"])
+    try:
+        return int(row["account_count"])
+    except (TypeError, KeyError, IndexError):
+        return int(row[0])
 
 
 def db():
     if DATABASE_URL:
-        if psycopg is None:
-            raise RuntimeError(
-                "DATABASE_URL is configured but psycopg is not installed; "
-                "add 'psycopg[binary]' to requirements.txt"
-            )
-        raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-        conn = _PostgresConnection(raw)
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("DATABASE_URL is set but psycopg is not installed; add psycopg[binary] to requirements.txt") from exc
+        raw=psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
+        conn=_PostgresConnection(raw)
+        # PostgreSQL-compatible schema; account data persists in the managed database.
         conn.execute("""CREATE TABLE IF NOT EXISTS activations(
           id BIGSERIAL PRIMARY KEY, serial TEXT NOT NULL, client_code TEXT NOT NULL,
           customer_name TEXT, device_id TEXT NOT NULL, activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
@@ -191,11 +193,24 @@ def db():
         conn.execute("""CREATE TABLE IF NOT EXISTS license_usage(
           serial TEXT PRIMARY KEY, activation_count INTEGER NOT NULL DEFAULT 0,
           last_device_id TEXT, updated_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS client_accounts(
+          id BIGSERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+          email TEXT NOT NULL UNIQUE, license_id TEXT NOT NULL, full_name TEXT NOT NULL,
+          mobile TEXT, dob TEXT, account_name TEXT, broker TEXT, client_code TEXT,
+          address TEXT, bo_id TEXT, pan TEXT, dp_name TEXT, segments TEXT,
+          otp_method TEXT, secret_questions_json TEXT, password_hash TEXT NOT NULL,
+          secret_answers_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS client_logs(
+          id BIGSERIAL PRIMARY KEY, license_id TEXT, username TEXT,
+          event_type TEXT NOT NULL, severity TEXT NOT NULL, module TEXT,
+          message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
+          app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
+          metadata_json TEXT)""")
         conn.commit()
         return conn
 
-    conn=sqlite3.connect(DB_PATH)
-    conn.row_factory=sqlite3.Row
+    conn=sqlite3.connect(DB_PATH); conn.row_factory=sqlite3.Row
     conn.execute("""CREATE TABLE IF NOT EXISTS activations(
       id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT NOT NULL, client_code TEXT NOT NULL,
       customer_name TEXT, device_id TEXT NOT NULL, activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
@@ -204,8 +219,21 @@ def db():
     conn.execute("""CREATE TABLE IF NOT EXISTS license_usage(
       serial TEXT PRIMARY KEY, activation_count INTEGER NOT NULL DEFAULT 0,
       last_device_id TEXT, updated_at TEXT NOT NULL)""")
-    conn.commit()
-    return conn
+    conn.execute("""CREATE TABLE IF NOT EXISTS client_accounts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE, license_id TEXT NOT NULL, full_name TEXT NOT NULL,
+      mobile TEXT, dob TEXT, account_name TEXT, broker TEXT, client_code TEXT,
+      address TEXT, bo_id TEXT, pan TEXT, dp_name TEXT, segments TEXT,
+      otp_method TEXT, secret_questions_json TEXT, password_hash TEXT NOT NULL,
+      secret_answers_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS client_logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, license_id TEXT, username TEXT,
+      event_type TEXT NOT NULL, severity TEXT NOT NULL, module TEXT,
+      message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
+      app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
+      metadata_json TEXT)""")
+    conn.commit(); return conn
 
 def respond(h,code,payload):
     raw=json.dumps(payload).encode(); h.send_response(code)
@@ -383,6 +411,109 @@ def status(serial):
         if meta.get(key) not in (None, ""): result[key]=meta[key]
     return 200,result
 
+def _password_hash(value):
+    salt=secrets.token_bytes(16)
+    digest=hashlib.pbkdf2_hmac("sha256", str(value).encode("utf-8"), salt, 310000)
+    return salt.hex()+":"+digest.hex()
+
+def _answers_hash(value):
+    # Store a salted hash of normalized answers; never store answers in clear text.
+    normalized="|".join(str(x or "").strip().casefold() for x in (value if isinstance(value,list) else []))
+    return _password_hash(normalized)
+
+def _safe_text(value, limit=4000):
+    return str(value or "").strip()[:limit]
+
+def save_client_signup(payload):
+    """Create one central account per username, email, and License ID.
+
+    Duplicate checks run inside a write transaction so concurrent requests cannot
+    register the same License ID twice. Existing rows are never deleted.
+    """
+    username=_safe_text(payload.get("username"),120)
+    email=_safe_text(payload.get("email"),254).lower()
+    license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
+    full_name=_safe_text(payload.get("full_name") or payload.get("fullName"),200)
+    password=str(payload.get("password") or "")
+    answers=payload.get("secret_answers") or payload.get("secretAnswers") or []
+    if not username or not email or not license_id or not full_name or len(password)<6:
+        return 400,{"ok":False,"error":"required signup fields missing","reason":"required_fields"}
+    if not isinstance(answers,list) or len(answers)<3 or any(not str(x or "").strip() for x in answers[:3]):
+        return 400,{"ok":False,"error":"three security answers are required","reason":"security_answers_required"}
+
+    # Never trust the client-provided License ID alone. LMP must be reachable
+    # and contain an active, unexpired license before new signup is accepted.
+    meta=local_license_metadata(license_id)
+    if not meta:
+        return 403,{"ok":False,"error":"License ID could not be verified against License Management Pro. Check the server's LMP database connection.","reason":"lmp_license_not_found"}
+    if str(meta.get("status") or "").strip().lower() != "active":
+        return 403,{"ok":False,"error":"This License is not Active in License Management Pro.","reason":"license_inactive","license_status":meta.get("status","")}
+    expiry_at=expiry_iso(meta.get("expiry_date"))
+    if not expiry_at:
+        return 403,{"ok":False,"error":"License expiry date is missing or invalid in License Management Pro.","reason":"invalid_lmp_expiry"}
+    if datetime.fromisoformat(expiry_at.replace("Z","+00:00")) <= datetime.now(timezone.utc):
+        return 403,{"ok":False,"error":"This License has expired. Please use the existing account's Renew flow.","reason":"license_expired","expiry_at":expiry_at}
+
+    now=utc_now(); conn=db()
+    try:
+        # IMMEDIATE serializes concurrent signup writers before duplicate checks.
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM client_accounts WHERE UPPER(TRIM(license_id))=? LIMIT 1",(license_id,)).fetchone():
+            conn.rollback()
+            return 409,{"ok":False,"error":"This License ID is already registered to an account. Please Login instead of signing up again.","reason":"license_already_registered"}
+        if conn.execute("SELECT 1 FROM client_accounts WHERE LOWER(TRIM(username))=LOWER(TRIM(?)) LIMIT 1",(username,)).fetchone():
+            conn.rollback()
+            return 409,{"ok":False,"error":"This username is already registered. Please choose another username or Login.","reason":"username_exists"}
+        if conn.execute("SELECT 1 FROM client_accounts WHERE LOWER(TRIM(email))=LOWER(TRIM(?)) LIMIT 1",(email,)).fetchone():
+            conn.rollback()
+            return 409,{"ok":False,"error":"This email is already registered. Please Login or use Forgot Username/Password.","reason":"email_exists"}
+
+        conn.execute("""INSERT INTO client_accounts
+          (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (username,email,license_id,full_name,_safe_text(payload.get("mobile"),40),_safe_text(payload.get("dob"),80),
+           _safe_text(payload.get("account_name") or payload.get("accountName"),120),_safe_text(payload.get("broker"),120),
+           _safe_text(payload.get("client_code") or payload.get("clientCode"),120),_safe_text(payload.get("address"),500),
+           _safe_text(payload.get("bo_id") or payload.get("boId"),100),_safe_text(payload.get("pan"),30),
+           _safe_text(payload.get("dp_name") or payload.get("dpName"),200),_safe_text(payload.get("segments"),500),
+           _safe_text(payload.get("otp_method") or payload.get("otpMethod"),30),
+           json.dumps(payload.get("secret_questions") or payload.get("secretQuestions") or []),
+           _password_hash(password),_answers_hash(answers[:3]),now,now))
+        conn.commit()
+        return 201,{"ok":True,"username":username,"license_id":license_id,"created_at":now}
+    except Exception as exc:
+        conn.rollback()
+        if isinstance(exc, sqlite3.IntegrityError) or exc.__class__.__name__ in {"UniqueViolation", "IntegrityError"}:
+            return 409,{"ok":False,"error":"Username, email, or License ID is already registered.","reason":"duplicate_account_field"}
+        raise
+    finally:
+        conn.close()
+
+def save_client_log(payload):
+    # Deliberately reject common secret fields; logs must never receive passwords/answers.
+    if any(k.lower() in {"password","confirm_password","secret_answers","secretanswers","token","api_key"} for k in payload):
+        return 400,{"ok":False,"error":"sensitive fields are not accepted in logs"}
+    license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
+    event_type=_safe_text(payload.get("event_type") or payload.get("eventType") or "event",80)
+    severity=_safe_text(payload.get("severity") or "INFO",20).upper()
+    message=_safe_text(payload.get("message"),4000)
+    if not message: return 400,{"ok":False,"error":"message is required"}
+    now=utc_now(); conn=db()
+    try:
+        conn.execute("""INSERT INTO client_logs
+          (license_id,username,event_type,severity,module,message,stack_trace,last_success_step,app_version,client_time,server_time,metadata_json)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (license_id,_safe_text(payload.get("username"),120),event_type,severity,_safe_text(payload.get("module"),120),message,
+           _safe_text(payload.get("stack_trace") or payload.get("stackTrace"),12000),_safe_text(payload.get("last_success_step") or payload.get("lastSuccessStep"),1000),
+           _safe_text(payload.get("app_version") or payload.get("appVersion"),80),_safe_text(payload.get("client_time") or payload.get("clientTime"),80),now,
+           json.dumps(payload.get("metadata") or {})[:8000]))
+        conn.commit(); return 201,{"ok":True,"server_time":now}
+    finally: conn.close()
+
+def admin_authorized(handler):
+    supplied=handler.headers.get("X-DPM-Admin-Token","")
+    return bool(ADMIN_RESET_TOKEN) and hmac.compare_digest(supplied,ADMIN_RESET_TOKEN)
+
 class Handler(BaseHTTPRequestHandler):
     server_version="DPM-License-Tracker/1.0"
     def log_message(self,fmt,*args): print(f"[{utc_now()}] {self.address_string()} - {fmt%args}")
@@ -390,22 +521,67 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204); self.send_header("Access-Control-Allow-Origin","*"); self.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS"); self.send_header("Access-Control-Allow-Headers","Content-Type"); self.end_headers()
     def do_GET(self):
         parsed=urlparse(self.path)
-        if parsed.path=="/health": return respond(self,200,{"ok":True,"service":"DPM license activation tracker","time":utc_now()})
+        if parsed.path in ("/health", "/healthz"): return respond(self,200,{"ok":True,"service":"DPM central license/account/log server","time":utc_now()})
+        if parsed.path=="/v1/admin/logs":
+            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            q=parse_qs(parsed.query); serial=q.get("license_id",[""])[0].strip().upper(); limit=min(max(int(q.get("limit",["100"])[0]),1),500)
+            conn=db()
+            try:
+                if serial: rows=conn.execute("SELECT * FROM client_logs WHERE license_id=? ORDER BY id DESC LIMIT ?",(serial,limit)).fetchall()
+                else: rows=conn.execute("SELECT * FROM client_logs ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
+                return respond(self,200,{"ok":True,"items":[dict(r) for r in rows]})
+            finally: conn.close()
+        if parsed.path=="/v1/admin/accounts":
+            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            q=parse_qs(parsed.query); serial=q.get("license_id",[""])[0].strip().upper(); limit=min(max(int(q.get("limit",["100"])[0]),1),500)
+            conn=db()
+            try:
+                fields="id,username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,created_at,updated_at"
+                if serial: rows=conn.execute(f"SELECT {fields} FROM client_accounts WHERE license_id=? ORDER BY id DESC LIMIT ?",(serial,limit)).fetchall()
+                else: rows=conn.execute(f"SELECT {fields} FROM client_accounts ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
+                return respond(self,200,{"ok":True,"items":[dict(r) for r in rows]})
+            finally: conn.close()
         if parsed.path=="/v1/activation/status":
             code,payload=status(parse_qs(parsed.query).get("serial",[""])[0]); return respond(self,code,payload)
         return respond(self,404,{"ok":False,"error":"not found"})
     def do_POST(self):
         parsed=urlparse(self.path); payload=read_json(self)
         if payload is None: return respond(self,400,{"ok":False,"error":"invalid JSON"})
+        if parsed.path == "/v1/accounts/signup":
+            code,result=save_client_signup(payload); return respond(self,code,result)
+        if parsed.path == "/v1/accounts/forgot-username":
+            # Exact registered-email lookup against the central account database.
+            # Do not expose account data beyond the username needed for recovery.
+            email=_safe_text(payload.get("email"),254).strip().lower()
+            if not email or "@" not in email:
+                return respond(self,400,{"ok":False,"error":"Enter a valid registered email address.","reason":"invalid_email"})
+            conn=db()
+            try:
+                # Diagnostic only: never log the email address or username.
+                row=conn.execute("SELECT username FROM client_accounts WHERE LOWER(TRIM(email))=? LIMIT 1",(email,)).fetchone()
+                account_count=get_client_account_count(conn)
+                if not row:
+                    print(f"[account-recovery] result=not_found db={os.path.abspath(DB_PATH)!r} central_account_count={account_count}", flush=True)
+                    return respond(self,404,{"ok":False,"error":"No central account found with this email.","reason":"account_not_found"})
+                print(f"[account-recovery] result=found db={os.path.abspath(DB_PATH)!r} central_account_count={account_count}", flush=True)
+                return respond(self,200,{"ok":True,"username":row["username"]})
+            finally:
+                conn.close()
+        if parsed.path == "/v1/logs":
+            code,result=save_client_log(payload); return respond(self,code,result)
         if parsed.path in ("/v1/activation/register","/v1/activation/heartbeat"):
             code,result=register(payload,self.client_address[0]); return respond(self,code,result)
         if parsed.path == "/v1/activation/reset":
+            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
             code,result=reset_activations(payload); return respond(self,code,result)
         return respond(self,404,{"ok":False,"error":"not found"})
 
 if __name__=="__main__":
-    _startup_conn = db()
-    _startup_conn.close()
-    db_mode = "PostgreSQL" if DATABASE_URL else f"SQLite ({DB_PATH})"
-    print(f"DPM License Tracker listening on http://{HOST}:{PORT}; database={db_mode}")
+    _startup_conn=db()
+    try:
+        _account_count=get_client_account_count(_startup_conn)
+    finally:
+        _startup_conn.close()
+    database_label=("PostgreSQL (DATABASE_URL configured)" if DATABASE_URL else os.path.abspath(DB_PATH))
+    print(f"DPM License Tracker listening on http://{HOST}:{PORT}; database={database_label!r}; central_accounts={_account_count}", flush=True)
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
