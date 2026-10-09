@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 ISSUER_SALT="DPM-2026-LICENSE-V1"
-DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
+DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB", "/var/data/dpm_server.db" if os.path.isdir("/var/data") else "activation_server.db")
 HOST=os.environ.get("DPM_LICENSE_SERVER_HOST","0.0.0.0")
 PORT=int(os.environ.get("PORT", os.environ.get("DPM_LICENSE_SERVER_PORT","9191")))
 MAX_ACTIVATIONS=3
@@ -151,7 +151,12 @@ def decode_serial(serial):
     return {"serial":serial,"client_code":client,"expiry_date":expiry.strftime("%Y-%m-%d"),"license_count":count,"expiry_epoch":expiry.timestamp()}
 
 def db():
-    conn=sqlite3.connect(DB_PATH); conn.row_factory=sqlite3.Row
+    parent=os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(parent, exist_ok=True)
+    conn=sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.row_factory=sqlite3.Row
     conn.execute("""CREATE TABLE IF NOT EXISTS activations(
       id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT NOT NULL, client_code TEXT NOT NULL,
       customer_name TEXT, device_id TEXT NOT NULL, activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
@@ -179,10 +184,16 @@ def db():
 def respond(h,code,payload):
     raw=json.dumps(payload).encode(); h.send_response(code)
     h.send_header("Content-Type","application/json; charset=utf-8"); h.send_header("Content-Length",str(len(raw)))
-    h.send_header("Access-Control-Allow-Origin","*"); h.end_headers(); h.wfile.write(raw)
+    h.send_header("X-Content-Type-Options","nosniff")
+    h.send_header("Cache-Control","no-store")
+    h.end_headers(); h.wfile.write(raw)
 
 def read_json(h):
-    try: return json.loads(h.rfile.read(int(h.headers.get("Content-Length","0"))).decode("utf-8"))
+    try:
+        size=int(h.headers.get("Content-Length","0"))
+        if size < 1 or size > 65536: return None
+        value=json.loads(h.rfile.read(size).decode("utf-8"))
+        return value if isinstance(value,dict) else None
     except Exception: return None
 
 def local_license_metadata(serial):
@@ -424,7 +435,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version="DPM-License-Tracker/1.0"
     def log_message(self,fmt,*args): print(f"[{utc_now()}] {self.address_string()} - {fmt%args}")
     def do_OPTIONS(self):
-        self.send_response(204); self.send_header("Access-Control-Allow-Origin","*"); self.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS"); self.send_header("Access-Control-Allow-Headers","Content-Type"); self.end_headers()
+        # Native desktop client does not require permissive browser CORS.
+        self.send_response(204); self.send_header("Allow","GET, POST, OPTIONS"); self.end_headers()
     def do_GET(self):
         parsed=urlparse(self.path)
         if parsed.path in ("/health", "/healthz"): return respond(self,200,{"ok":True,"service":"DPM central license/account/log server","time":utc_now()})

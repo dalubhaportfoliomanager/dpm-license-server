@@ -1,1 +1,1 @@
-# This server currently uses Python standard-library modules only.
+# DPM central server uses Python standard-library modules only.
