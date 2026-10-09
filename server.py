@@ -496,9 +496,13 @@ class Handler(BaseHTTPRequestHandler):
                 return respond(self,400,{"ok":False,"error":"Enter a valid registered email address.","reason":"invalid_email"})
             conn=db()
             try:
+                # Diagnostic only: never log the email address or username.
                 row=conn.execute("SELECT username FROM client_accounts WHERE LOWER(TRIM(email))=? LIMIT 1",(email,)).fetchone()
+                account_count=conn.execute("SELECT COUNT(*) FROM client_accounts").fetchone()[0]
                 if not row:
+                    print(f"[account-recovery] result=not_found db={os.path.abspath(DB_PATH)!r} central_account_count={account_count}", flush=True)
                     return respond(self,404,{"ok":False,"error":"No central account found with this email.","reason":"account_not_found"})
+                print(f"[account-recovery] result=found db={os.path.abspath(DB_PATH)!r} central_account_count={account_count}", flush=True)
                 return respond(self,200,{"ok":True,"username":row["username"]})
             finally:
                 conn.close()
@@ -512,4 +516,10 @@ class Handler(BaseHTTPRequestHandler):
         return respond(self,404,{"ok":False,"error":"not found"})
 
 if __name__=="__main__":
-    db().close(); print(f"DPM License Tracker listening on http://{HOST}:{PORT}"); ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+    _startup_conn=db()
+    try:
+        _account_count=_startup_conn.execute("SELECT COUNT(*) FROM client_accounts").fetchone()[0]
+    finally:
+        _startup_conn.close()
+    print(f"DPM License Tracker listening on http://{HOST}:{PORT}; database={os.path.abspath(DB_PATH)!r}; central_accounts={_account_count}", flush=True)
+    ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
