@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dalubha Portfolio Manager central license activation tracker (stdlib only)."""
 from __future__ import annotations
-import json, os, re, sqlite3
+import json, os, re, sqlite3, hashlib, secrets, hmac
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,7 +11,7 @@ DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 HOST=os.environ.get("DPM_LICENSE_SERVER_HOST","0.0.0.0")
 PORT=int(os.environ.get("PORT", os.environ.get("DPM_LICENSE_SERVER_PORT","9191")))
 MAX_ACTIVATIONS=3
-ADMIN_RESET_TOKEN=os.environ.get("DPM_LICENSE_ADMIN_TOKEN","DALUBHA-ADMIN-RESET-2026")
+ADMIN_RESET_TOKEN=os.environ.get("DPM_LICENSE_ADMIN_TOKEN","")
 # License Management Pro is the authoritative license database.
 # DPM and License Management Pro are sibling project folders.
 _DEFAULT_LMP_DB_PATH=os.path.abspath(os.path.join(
@@ -160,6 +160,20 @@ def db():
     conn.execute("""CREATE TABLE IF NOT EXISTS license_usage(
       serial TEXT PRIMARY KEY, activation_count INTEGER NOT NULL DEFAULT 0,
       last_device_id TEXT, updated_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS client_accounts(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL UNIQUE, license_id TEXT NOT NULL, full_name TEXT NOT NULL,
+      mobile TEXT, dob TEXT, account_name TEXT, broker TEXT, client_code TEXT,
+      address TEXT, bo_id TEXT, pan TEXT, dp_name TEXT, segments TEXT,
+      otp_method TEXT, secret_questions_json TEXT, password_hash TEXT NOT NULL,
+      secret_answers_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS client_logs(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, license_id TEXT, username TEXT,
+      event_type TEXT NOT NULL, severity TEXT NOT NULL, module TEXT,
+      message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
+      app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
+      metadata_json TEXT)""")
     conn.commit(); return conn
 
 def respond(h,code,payload):
@@ -338,6 +352,74 @@ def status(serial):
         if meta.get(key) not in (None, ""): result[key]=meta[key]
     return 200,result
 
+def _password_hash(value):
+    salt=secrets.token_bytes(16)
+    digest=hashlib.pbkdf2_hmac("sha256", str(value).encode("utf-8"), salt, 310000)
+    return salt.hex()+":"+digest.hex()
+
+def _answers_hash(value):
+    # Store a salted hash of normalized answers; never store answers in clear text.
+    normalized="|".join(str(x or "").strip().casefold() for x in (value if isinstance(value,list) else []))
+    return _password_hash(normalized)
+
+def _safe_text(value, limit=4000):
+    return str(value or "").strip()[:limit]
+
+def save_client_signup(payload):
+    username=_safe_text(payload.get("username"),120)
+    email=_safe_text(payload.get("email"),254).lower()
+    license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
+    full_name=_safe_text(payload.get("full_name") or payload.get("fullName"),200)
+    password=str(payload.get("password") or "")
+    answers=payload.get("secret_answers") or payload.get("secretAnswers") or []
+    if not username or not email or not license_id or not full_name or len(password)<6:
+        return 400,{"ok":False,"error":"required signup fields missing"}
+    if not isinstance(answers,list) or len(answers)<3 or any(not str(x or "").strip() for x in answers[:3]):
+        return 400,{"ok":False,"error":"three security answers are required"}
+    now=utc_now(); conn=db()
+    try:
+        conn.execute("""INSERT INTO client_accounts
+          (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (username,email,license_id,full_name,_safe_text(payload.get("mobile"),40),_safe_text(payload.get("dob"),80),
+           _safe_text(payload.get("account_name") or payload.get("accountName"),120),_safe_text(payload.get("broker"),120),
+           _safe_text(payload.get("client_code") or payload.get("clientCode"),120),_safe_text(payload.get("address"),500),
+           _safe_text(payload.get("bo_id") or payload.get("boId"),100),_safe_text(payload.get("pan"),30),
+           _safe_text(payload.get("dp_name") or payload.get("dpName"),200),_safe_text(payload.get("segments"),500),
+           _safe_text(payload.get("otp_method") or payload.get("otpMethod"),30),
+           json.dumps(payload.get("secret_questions") or payload.get("secretQuestions") or []),
+           _password_hash(password),_answers_hash(answers[:3]),now,now))
+        conn.commit()
+        return 201,{"ok":True,"username":username,"license_id":license_id,"created_at":now}
+    except sqlite3.IntegrityError:
+        return 409,{"ok":False,"error":"username or email already exists"}
+    finally: conn.close()
+
+def save_client_log(payload):
+    # Deliberately reject common secret fields; logs must never receive passwords/answers.
+    if any(k.lower() in {"password","confirm_password","secret_answers","secretanswers","token","api_key"} for k in payload):
+        return 400,{"ok":False,"error":"sensitive fields are not accepted in logs"}
+    license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
+    event_type=_safe_text(payload.get("event_type") or payload.get("eventType") or "event",80)
+    severity=_safe_text(payload.get("severity") or "INFO",20).upper()
+    message=_safe_text(payload.get("message"),4000)
+    if not message: return 400,{"ok":False,"error":"message is required"}
+    now=utc_now(); conn=db()
+    try:
+        conn.execute("""INSERT INTO client_logs
+          (license_id,username,event_type,severity,module,message,stack_trace,last_success_step,app_version,client_time,server_time,metadata_json)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (license_id,_safe_text(payload.get("username"),120),event_type,severity,_safe_text(payload.get("module"),120),message,
+           _safe_text(payload.get("stack_trace") or payload.get("stackTrace"),12000),_safe_text(payload.get("last_success_step") or payload.get("lastSuccessStep"),1000),
+           _safe_text(payload.get("app_version") or payload.get("appVersion"),80),_safe_text(payload.get("client_time") or payload.get("clientTime"),80),now,
+           json.dumps(payload.get("metadata") or {})[:8000]))
+        conn.commit(); return 201,{"ok":True,"server_time":now}
+    finally: conn.close()
+
+def admin_authorized(handler):
+    supplied=handler.headers.get("X-DPM-Admin-Token","")
+    return bool(ADMIN_RESET_TOKEN) and hmac.compare_digest(supplied,ADMIN_RESET_TOKEN)
+
 class Handler(BaseHTTPRequestHandler):
     server_version="DPM-License-Tracker/1.0"
     def log_message(self,fmt,*args): print(f"[{utc_now()}] {self.address_string()} - {fmt%args}")
@@ -345,16 +427,40 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204); self.send_header("Access-Control-Allow-Origin","*"); self.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS"); self.send_header("Access-Control-Allow-Headers","Content-Type"); self.end_headers()
     def do_GET(self):
         parsed=urlparse(self.path)
-        if parsed.path=="/health": return respond(self,200,{"ok":True,"service":"DPM license activation tracker","time":utc_now()})
+        if parsed.path in ("/health", "/healthz"): return respond(self,200,{"ok":True,"service":"DPM central license/account/log server","time":utc_now()})
+        if parsed.path=="/v1/admin/logs":
+            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            q=parse_qs(parsed.query); serial=q.get("license_id",[""])[0].strip().upper(); limit=min(max(int(q.get("limit",["100"])[0]),1),500)
+            conn=db()
+            try:
+                if serial: rows=conn.execute("SELECT * FROM client_logs WHERE license_id=? ORDER BY id DESC LIMIT ?",(serial,limit)).fetchall()
+                else: rows=conn.execute("SELECT * FROM client_logs ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
+                return respond(self,200,{"ok":True,"items":[dict(r) for r in rows]})
+            finally: conn.close()
+        if parsed.path=="/v1/admin/accounts":
+            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            q=parse_qs(parsed.query); serial=q.get("license_id",[""])[0].strip().upper(); limit=min(max(int(q.get("limit",["100"])[0]),1),500)
+            conn=db()
+            try:
+                fields="id,username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,created_at,updated_at"
+                if serial: rows=conn.execute(f"SELECT {fields} FROM client_accounts WHERE license_id=? ORDER BY id DESC LIMIT ?",(serial,limit)).fetchall()
+                else: rows=conn.execute(f"SELECT {fields} FROM client_accounts ORDER BY id DESC LIMIT ?",(limit,)).fetchall()
+                return respond(self,200,{"ok":True,"items":[dict(r) for r in rows]})
+            finally: conn.close()
         if parsed.path=="/v1/activation/status":
             code,payload=status(parse_qs(parsed.query).get("serial",[""])[0]); return respond(self,code,payload)
         return respond(self,404,{"ok":False,"error":"not found"})
     def do_POST(self):
         parsed=urlparse(self.path); payload=read_json(self)
         if payload is None: return respond(self,400,{"ok":False,"error":"invalid JSON"})
+        if parsed.path == "/v1/accounts/signup":
+            code,result=save_client_signup(payload); return respond(self,code,result)
+        if parsed.path == "/v1/logs":
+            code,result=save_client_log(payload); return respond(self,code,result)
         if parsed.path in ("/v1/activation/register","/v1/activation/heartbeat"):
             code,result=register(payload,self.client_address[0]); return respond(self,code,result)
         if parsed.path == "/v1/activation/reset":
+            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
             code,result=reset_activations(payload); return respond(self,code,result)
         return respond(self,404,{"ok":False,"error":"not found"})
 
