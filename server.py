@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dalubha Portfolio Manager central license activation tracker (stdlib only)."""
+"""Dalubha Portfolio Manager central license/account tracker (SQLite or PostgreSQL)."""
 from __future__ import annotations
 import json, os, re, sqlite3, hashlib, secrets, hmac
 from datetime import datetime, timezone
@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
+DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
 HOST=os.environ.get("DPM_LICENSE_SERVER_HOST","0.0.0.0")
 PORT=int(os.environ.get("PORT", os.environ.get("DPM_LICENSE_SERVER_PORT","9191")))
 MAX_ACTIVATIONS=3
@@ -150,7 +151,52 @@ def decode_serial(serial):
     if count<1: return None
     return {"serial":serial,"client_code":client,"expiry_date":expiry.strftime("%Y-%m-%d"),"license_count":count,"expiry_epoch":expiry.timestamp()}
 
+class _PostgresConnection:
+    """Small compatibility adapter so existing SQL can use ? placeholders."""
+    def __init__(self, raw):
+        self.raw = raw
+    def execute(self, sql, params=()):
+        sql = sql.replace("BEGIN IMMEDIATE", "BEGIN").replace("?", "%s")
+        return self.raw.execute(sql, params)
+    def commit(self): return self.raw.commit()
+    def rollback(self): return self.raw.rollback()
+    def close(self): return self.raw.close()
+
 def db():
+    if DATABASE_URL:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError("DATABASE_URL is set but psycopg is not installed; add psycopg[binary] to requirements.txt") from exc
+        raw=psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
+        conn=_PostgresConnection(raw)
+        # PostgreSQL-compatible schema; account data persists in the managed database.
+        conn.execute("""CREATE TABLE IF NOT EXISTS activations(
+          id BIGSERIAL PRIMARY KEY, serial TEXT NOT NULL, client_code TEXT NOT NULL,
+          customer_name TEXT, device_id TEXT NOT NULL, activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+          app_version TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE', license_count INTEGER NOT NULL,
+          expiry_date TEXT NOT NULL, first_ip TEXT, last_ip TEXT, UNIQUE(serial,device_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS license_usage(
+          serial TEXT PRIMARY KEY, activation_count INTEGER NOT NULL DEFAULT 0,
+          last_device_id TEXT, updated_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS client_accounts(
+          id BIGSERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+          email TEXT NOT NULL UNIQUE, license_id TEXT NOT NULL, full_name TEXT NOT NULL,
+          mobile TEXT, dob TEXT, account_name TEXT, broker TEXT, client_code TEXT,
+          address TEXT, bo_id TEXT, pan TEXT, dp_name TEXT, segments TEXT,
+          otp_method TEXT, secret_questions_json TEXT, password_hash TEXT NOT NULL,
+          secret_answers_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS client_logs(
+          id BIGSERIAL PRIMARY KEY, license_id TEXT, username TEXT,
+          event_type TEXT NOT NULL, severity TEXT NOT NULL, module TEXT,
+          message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
+          app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
+          metadata_json TEXT)""")
+        conn.commit()
+        return conn
+
     conn=sqlite3.connect(DB_PATH); conn.row_factory=sqlite3.Row
     conn.execute("""CREATE TABLE IF NOT EXISTS activations(
       id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT NOT NULL, client_code TEXT NOT NULL,
@@ -422,9 +468,11 @@ def save_client_signup(payload):
            _password_hash(password),_answers_hash(answers[:3]),now,now))
         conn.commit()
         return 201,{"ok":True,"username":username,"license_id":license_id,"created_at":now}
-    except sqlite3.IntegrityError:
+    except Exception as exc:
         conn.rollback()
-        return 409,{"ok":False,"error":"Username, email, or License ID is already registered.","reason":"duplicate_account_field"}
+        if isinstance(exc, sqlite3.IntegrityError) or exc.__class__.__name__ in {"UniqueViolation", "IntegrityError"}:
+            return 409,{"ok":False,"error":"Username, email, or License ID is already registered.","reason":"duplicate_account_field"}
+        raise
     finally:
         conn.close()
 
@@ -521,5 +569,6 @@ if __name__=="__main__":
         _account_count=_startup_conn.execute("SELECT COUNT(*) FROM client_accounts").fetchone()[0]
     finally:
         _startup_conn.close()
-    print(f"DPM License Tracker listening on http://{HOST}:{PORT}; database={os.path.abspath(DB_PATH)!r}; central_accounts={_account_count}", flush=True)
+    database_label=("PostgreSQL (DATABASE_URL configured)" if DATABASE_URL else os.path.abspath(DB_PATH))
+    print(f"DPM License Tracker listening on http://{HOST}:{PORT}; database={database_label!r}; central_accounts={_account_count}", flush=True)
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
