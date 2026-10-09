@@ -387,8 +387,30 @@ def save_client_signup(payload):
         return 400,{"ok":False,"error":"required signup fields missing"}
     if not isinstance(answers,list) or len(answers)<3 or any(not str(x or "").strip() for x in answers[:3]):
         return 400,{"ok":False,"error":"three security answers are required"}
+    # Validate the authoritative License Management Pro record before creating
+    # any central account. Never accept a syntactically valid key by itself.
+    meta=local_license_metadata(license_id)
+    if not meta:
+        return 403,{"ok":False,"error":"License ID could not be verified. It was not found in the central License Management Pro database.","reason":"lmp_license_not_found"}
+    if str(meta.get("status") or "").strip().lower() != "active":
+        return 403,{"ok":False,"error":"This License ID is not ACTIVE in License Management Pro.","reason":"lmp_license_inactive","license_status":meta.get("status","")}
+    expiry_at=expiry_iso(meta.get("expiry_date"))
+    if not expiry_at:
+        return 403,{"ok":False,"error":"This License ID has no valid expiry date.","reason":"invalid_lmp_expiry"}
+    if datetime.fromisoformat(expiry_at.replace("Z","+00:00")) <= datetime.now(timezone.utc):
+        return 403,{"ok":False,"error":"This License ID has expired.","reason":"license_expired","expiry_at":expiry_at}
+
     now=utc_now(); conn=db()
     try:
+        # Safe retry: if a previous signup attempt already created the same
+        # username + email + license, return success without duplicating it.
+        existing=conn.execute("SELECT username,email,license_id,created_at FROM client_accounts WHERE lower(username)=lower(?) OR lower(email)=lower(?) LIMIT 1",(username,email)).fetchone()
+        if existing:
+            if (existing["username"].casefold()==username.casefold()
+                    and existing["email"].casefold()==email.casefold()
+                    and existing["license_id"].upper()==license_id):
+                return 200,{"ok":True,"already_registered":True,"username":username,"license_id":license_id,"created_at":existing["created_at"]}
+            return 409,{"ok":False,"error":"Username or email already belongs to another account. Use account recovery or choose different details.","reason":"account_duplicate"}
         conn.execute("""INSERT INTO client_accounts
           (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,created_at,updated_at)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
