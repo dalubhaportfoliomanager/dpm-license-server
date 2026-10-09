@@ -488,6 +488,20 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None: return respond(self,400,{"ok":False,"error":"invalid JSON"})
         if parsed.path == "/v1/accounts/signup":
             code,result=save_client_signup(payload); return respond(self,code,result)
+        if parsed.path == "/v1/accounts/forgot-username":
+            # Exact registered-email lookup against the central account database.
+            # Do not expose account data beyond the username needed for recovery.
+            email=_safe_text(payload.get("email"),254).strip().lower()
+            if not email or "@" not in email:
+                return respond(self,400,{"ok":False,"error":"Enter a valid registered email address.","reason":"invalid_email"})
+            conn=db()
+            try:
+                row=conn.execute("SELECT username FROM client_accounts WHERE LOWER(TRIM(email))=? LIMIT 1",(email,)).fetchone()
+                if not row:
+                    return respond(self,404,{"ok":False,"error":"No central account found with this email.","reason":"account_not_found"})
+                return respond(self,200,{"ok":True,"username":row["username"]})
+            finally:
+                conn.close()
         if parsed.path == "/v1/logs":
             code,result=save_client_log(payload); return respond(self,code,result)
         if parsed.path in ("/v1/activation/register","/v1/activation/heartbeat"):
