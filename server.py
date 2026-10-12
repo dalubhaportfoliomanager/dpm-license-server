@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-import-fix-20261012-5"
+BUILD_ID="dpm-account-recovery-import-fix-20261012-6"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -608,6 +608,11 @@ class Handler(BaseHTTPRequestHandler):
             if not admin_authorized(self, payload):
                 print("[account-import] rejected reason=admin_unauthorized", flush=True)
                 return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            # Safe authenticated probe: validates admin auth without attempting an import.
+            # The diagnostic client must send {"probe": true}; an empty object would
+            # fall through to normal account validation and return HTTP 400.
+            if payload.get("probe") is True:
+                return respond(self,200,{"ok":True,"authorized":True,"build":BUILD_ID})
             try:
                 code,result=import_local_account(payload)
                 print(f"[account-import] status={code} reason={result.get('error', result.get('reason', 'ok'))!r} db={'postgresql' if DATABASE_URL else 'sqlite'}", flush=True)
