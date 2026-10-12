@@ -6,14 +6,14 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-import-fix-20261012-10"
+BUILD_ID="dpm-account-recovery-import-fix-20261012-9"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
 HOST=os.environ.get("DPM_LICENSE_SERVER_HOST","0.0.0.0")
 PORT=int(os.environ.get("PORT", os.environ.get("DPM_LICENSE_SERVER_PORT","9191")))
 MAX_ACTIVATIONS=3
-ADMIN_RESET_TOKEN=os.environ.get("DPM_LICENSE_ADMIN_TOKEN","")
+ADMIN_RESET_TOKEN=os.environ.get("DPM_LICENSE_ADMIN_TOKEN","").strip()
 # License Management Pro is the authoritative license database.
 # DPM and License Management Pro are sibling project folders.
 _DEFAULT_LMP_DB_PATH=os.path.abspath(os.path.join(
@@ -562,7 +562,9 @@ def admin_authorized(handler, payload=None):
         supplied=handler.headers.get("X-DPM-Admin-Token","")
     if not supplied and isinstance(payload,dict):
         supplied=str(payload.get("admin_token") or "")
-    return bool(ADMIN_RESET_TOKEN) and hmac.compare_digest(supplied,ADMIN_RESET_TOKEN)
+    supplied = str(supplied).strip()
+    expected = ADMIN_RESET_TOKEN.strip()
+    return bool(expected) and hmac.compare_digest(supplied, expected)
 
 class Handler(BaseHTTPRequestHandler):
     server_version="DPM-License-Tracker/1.0"
@@ -577,8 +579,8 @@ class Handler(BaseHTTPRequestHandler):
             try: count=get_client_account_count(conn)
             finally: conn.close()
             return respond(self,200,{"ok":True,"build":BUILD_ID,"database":"postgresql" if DATABASE_URL else "sqlite","central_accounts":count})
-        if parsed.path == "/v1/admin/probe":
-            # GET-only auth probe avoids edge/WAF rejection of diagnostic POST bodies.
+        if parsed.path in ("/admin-probe", "/v1/admin/probe"):
+            # GET-only auth probe on a short top-level path avoids edge/WAF rules on /v1/admin/.
             if not admin_authorized(self):
                 return respond(self,401,{"ok":False,"error":"admin authorization required"})
             return respond(self,200,{"ok":True,"authorized":True,"diagnostic":True})
@@ -609,14 +611,14 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             print(f"[request] invalid_json path={parsed.path!r} content_length={self.headers.get('Content-Length', '0')!r}", flush=True)
             return respond(self,400,{"ok":False,"error":"invalid JSON","reason":"invalid_json_body"})
-        if parsed.path in ("/admin-import", "/v1/admin/import-local-accounts"):
+        if parsed.path == "/v1/admin/import-local-accounts":
             if not admin_authorized(self, payload):
                 print("[account-import] rejected reason=admin_unauthorized", flush=True)
                 return respond(self,401,{"ok":False,"error":"admin authorization required"})
             # Safe auth-only probe: validates the same endpoint and token without
             # attempting to import an account or touching the database.
-            if payload.get("probe") is True and not any(k in payload for k in ("username", "email", "license_id", "licenseId")):
-                return respond(self,200,{"ok":True,"authorized":True,"diagnostic":True,"build":BUILD_ID})
+            if payload == {"probe": True}:
+                return respond(self,200,{"ok":True,"authorized":True,"diagnostic":True})
             try:
                 code,result=import_local_account(payload)
                 print(f"[account-import] status={code} reason={result.get('error', result.get('reason', 'ok'))!r} db={'postgresql' if DATABASE_URL else 'sqlite'}", flush=True)
