@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-import-fix-20261012-4"
+BUILD_ID="dpm-account-recovery-import-fix-20261012-5"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -552,13 +552,16 @@ def save_client_log(payload):
         conn.commit(); return 201,{"ok":True,"server_time":now}
     finally: conn.close()
 
-def admin_authorized(handler):
-    # Prefer the standard Authorization header; retain the legacy header for compatibility.
+def admin_authorized(handler, payload=None):
+    # Accept header auth for admin endpoints. The import tool can send the token
+    # in its JSON body if an upstream proxy rejects custom/auth headers.
     supplied=handler.headers.get("Authorization","")
     if supplied.lower().startswith("bearer "):
         supplied=supplied[7:].strip()
     else:
         supplied=handler.headers.get("X-DPM-Admin-Token","")
+    if not supplied and isinstance(payload,dict):
+        supplied=str(payload.get("admin_token") or "")
     return bool(ADMIN_RESET_TOKEN) and hmac.compare_digest(supplied,ADMIN_RESET_TOKEN)
 
 class Handler(BaseHTTPRequestHandler):
@@ -602,7 +605,7 @@ class Handler(BaseHTTPRequestHandler):
             print(f"[request] invalid_json path={parsed.path!r} content_length={self.headers.get('Content-Length', '0')!r}", flush=True)
             return respond(self,400,{"ok":False,"error":"invalid JSON","reason":"invalid_json_body"})
         if parsed.path == "/v1/admin/import-local-accounts":
-            if not admin_authorized(self):
+            if not admin_authorized(self, payload):
                 print("[account-import] rejected reason=admin_unauthorized", flush=True)
                 return respond(self,401,{"ok":False,"error":"admin authorization required"})
             try:
