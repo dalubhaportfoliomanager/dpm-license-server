@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-import-fix-20261012-7"
+BUILD_ID="dpm-account-recovery-import-fix-20261012-8"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -577,6 +577,11 @@ class Handler(BaseHTTPRequestHandler):
             try: count=get_client_account_count(conn)
             finally: conn.close()
             return respond(self,200,{"ok":True,"build":BUILD_ID,"database":"postgresql" if DATABASE_URL else "sqlite","central_accounts":count})
+        if parsed.path == "/v1/admin/probe":
+            # GET-only auth probe avoids edge/WAF rejection of diagnostic POST bodies.
+            if not admin_authorized(self):
+                return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            return respond(self,200,{"ok":True,"authorized":True,"diagnostic":True})
         if parsed.path=="/v1/admin/logs":
             if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
             q=parse_qs(parsed.query); serial=q.get("license_id",[""])[0].strip().upper(); limit=min(max(int(q.get("limit",["100"])[0]),1),500)
