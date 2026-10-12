@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+BUILD_ID="dpm-account-recovery-diagnostic-20261012-1"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -563,6 +564,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed=urlparse(self.path)
         if parsed.path in ("/health", "/healthz"): return respond(self,200,{"ok":True,"service":"DPM central license/account/log server","time":utc_now()})
+        if parsed.path == "/version":
+            conn=db()
+            try: count=get_client_account_count(conn)
+            finally: conn.close()
+            return respond(self,200,{"ok":True,"build":BUILD_ID,"database":"postgresql" if DATABASE_URL else "sqlite","central_accounts":count})
         if parsed.path=="/v1/admin/logs":
             if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
             q=parse_qs(parsed.query); serial=q.get("license_id",[""])[0].strip().upper(); limit=min(max(int(q.get("limit",["100"])[0]),1),500)
@@ -589,8 +595,16 @@ class Handler(BaseHTTPRequestHandler):
         parsed=urlparse(self.path); payload=read_json(self)
         if payload is None: return respond(self,400,{"ok":False,"error":"invalid JSON"})
         if parsed.path == "/v1/admin/import-local-accounts":
-            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
-            code,result=import_local_account(payload); return respond(self,code,result)
+            if not admin_authorized(self):
+                print("[account-import] rejected reason=admin_unauthorized", flush=True)
+                return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            try:
+                code,result=import_local_account(payload)
+                print(f"[account-import] status={code} reason={result.get('error', result.get('reason', 'ok'))!r} db={'postgresql' if DATABASE_URL else 'sqlite'}", flush=True)
+                return respond(self,code,result)
+            except Exception as exc:
+                print(f"[account-import] status=500 exception={type(exc).__name__}", flush=True)
+                return respond(self,500,{"ok":False,"error":"account import failed; inspect server logs","reason":"internal_error"})
         if parsed.path == "/v1/accounts/signup":
             code,result=save_client_signup(payload); return respond(self,code,result)
         if parsed.path == "/v1/accounts/forgot-username":
@@ -627,5 +641,5 @@ if __name__=="__main__":
     finally:
         _startup_conn.close()
     database_label=("PostgreSQL (DATABASE_URL configured)" if DATABASE_URL else os.path.abspath(DB_PATH))
-    print(f"DPM License Tracker listening on http://{HOST}:{PORT}; database={database_label!r}; central_accounts={_account_count}", flush=True)
+    print(f"DPM License Tracker build={BUILD_ID} listening on http://{HOST}:{PORT}; database={database_label!r}; central_accounts={_account_count}", flush=True)
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
