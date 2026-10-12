@@ -93,7 +93,33 @@ def expiry_iso(value):
 
     dt = parse_license_datetime(text)
     if dt is None:
-        return None
+        # LMP has used several display/storage formats over time. If the time
+        # portion is unfamiliar (milliseconds, AM/PM suffix, etc.), recover the
+        # calendar date only; expiry policy is end-of-day IST anyway.
+        date_patterns = (
+            r"(?i)(\d{1,2})[- ]([A-Z]{3})[- ](\d{4})",
+            r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})",
+            r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})",
+        )
+        recovered = None
+        for pattern in date_patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            try:
+                parts = match.groups()
+                if pattern == date_patterns[0]:
+                    recovered = datetime.strptime("-".join(parts), "%d-%b-%Y")
+                elif pattern == date_patterns[1]:
+                    recovered = datetime.strptime("/".join(parts), "%d/%m/%Y")
+                else:
+                    recovered = datetime.strptime("-".join(parts), "%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+        if recovered is None:
+            return None
+        dt = recovered.replace(tzinfo=IST).astimezone(timezone.utc)
 
     # parse_license_datetime returns UTC. Convert back to IST, keep only
     # the calendar date, and make that date valid through 11:59:59 PM IST.
@@ -339,7 +365,7 @@ def register(payload,ip):
     expiry_date=str(meta.get("expiry_date") or "").strip()
     expiry_at=expiry_iso(expiry_date)
     if not expiry_at:
-        return 403,{"ok":False,"error":"License has no valid expiry date in License Management Pro","reason":"invalid_lmp_expiry"}
+        return 403,{"ok":False,"error":"License has no valid expiry date in License Management Pro","reason":"invalid_lmp_expiry","expiry_date_received":str(meta.get("expiry_date") or "<empty>"),"build":BUILD_ID}
     expiry_dt=datetime.fromisoformat(expiry_at.replace("Z","+00:00"))
     if expiry_dt <= datetime.now(timezone.utc):
         return 403,{"ok":False,"error":"License has expired in License Management Pro","reason":"license_expired","expiry_at":expiry_at}
@@ -412,7 +438,7 @@ def status(serial):
 
     expiry_at=expiry_iso(meta.get("expiry_date"))
     if not expiry_at:
-        return 403,{"ok":False,"error":"License has no valid expiry date in License Management Pro","reason":"invalid_lmp_expiry"}
+        return 403,{"ok":False,"error":"License has no valid expiry date in License Management Pro","reason":"invalid_lmp_expiry","expiry_date_received":str(meta.get("expiry_date") or "<empty>"),"build":BUILD_ID}
 
     if datetime.fromisoformat(expiry_at.replace("Z","+00:00")) <= datetime.now(timezone.utc):
         return 403,{"ok":False,"error":"License has expired in License Management Pro","reason":"license_expired","expiry_at":expiry_at}
