@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-import-fix-20261012-9"
+BUILD_ID="dpm-account-recovery-import-fix-20261012-10"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -577,8 +577,8 @@ class Handler(BaseHTTPRequestHandler):
             try: count=get_client_account_count(conn)
             finally: conn.close()
             return respond(self,200,{"ok":True,"build":BUILD_ID,"database":"postgresql" if DATABASE_URL else "sqlite","central_accounts":count})
-        if parsed.path in ("/admin-probe", "/v1/admin/probe"):
-            # GET-only auth probe on a short top-level path avoids edge/WAF rules on /v1/admin/.
+        if parsed.path == "/v1/admin/probe":
+            # GET-only auth probe avoids edge/WAF rejection of diagnostic POST bodies.
             if not admin_authorized(self):
                 return respond(self,401,{"ok":False,"error":"admin authorization required"})
             return respond(self,200,{"ok":True,"authorized":True,"diagnostic":True})
@@ -609,14 +609,14 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             print(f"[request] invalid_json path={parsed.path!r} content_length={self.headers.get('Content-Length', '0')!r}", flush=True)
             return respond(self,400,{"ok":False,"error":"invalid JSON","reason":"invalid_json_body"})
-        if parsed.path == "/v1/admin/import-local-accounts":
+        if parsed.path in ("/admin-import", "/v1/admin/import-local-accounts"):
             if not admin_authorized(self, payload):
                 print("[account-import] rejected reason=admin_unauthorized", flush=True)
                 return respond(self,401,{"ok":False,"error":"admin authorization required"})
             # Safe auth-only probe: validates the same endpoint and token without
             # attempting to import an account or touching the database.
-            if payload == {"probe": True}:
-                return respond(self,200,{"ok":True,"authorized":True,"diagnostic":True})
+            if payload.get("probe") is True and not any(k in payload for k in ("username", "email", "license_id", "licenseId")):
+                return respond(self,200,{"ok":True,"authorized":True,"diagnostic":True,"build":BUILD_ID})
             try:
                 code,result=import_local_account(payload)
                 print(f"[account-import] status={code} reason={result.get('error', result.get('reason', 'ok'))!r} db={'postgresql' if DATABASE_URL else 'sqlite'}", flush=True)
