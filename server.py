@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-diagnostic-20261012-1"
+BUILD_ID="dpm-account-recovery-import-fix-20261012-2"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -593,7 +593,9 @@ class Handler(BaseHTTPRequestHandler):
         return respond(self,404,{"ok":False,"error":"not found"})
     def do_POST(self):
         parsed=urlparse(self.path); payload=read_json(self)
-        if payload is None: return respond(self,400,{"ok":False,"error":"invalid JSON"})
+        if payload is None:
+            print(f"[request] invalid_json path={parsed.path!r} content_length={self.headers.get('Content-Length', '0')!r}", flush=True)
+            return respond(self,400,{"ok":False,"error":"invalid JSON","reason":"invalid_json_body"})
         if parsed.path == "/v1/admin/import-local-accounts":
             if not admin_authorized(self):
                 print("[account-import] rejected reason=admin_unauthorized", flush=True)
