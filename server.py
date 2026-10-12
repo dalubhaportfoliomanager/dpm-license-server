@@ -209,6 +209,11 @@ def db():
           message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
           app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
           metadata_json TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS lmp_license_mirror(
+          license_key TEXT PRIMARY KEY, customer_name TEXT, product_name TEXT,
+          issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
+          license_count INTEGER NOT NULL DEFAULT 1, status TEXT, activation_date TEXT,
+          renewal_date TEXT, remark TEXT, synced_at TEXT NOT NULL)""")
         conn.commit()
         return conn
 
@@ -235,6 +240,11 @@ def db():
       message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
       app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
       metadata_json TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS lmp_license_mirror(
+      license_key TEXT PRIMARY KEY, customer_name TEXT, product_name TEXT,
+      issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
+      license_count INTEGER NOT NULL DEFAULT 1, status TEXT, activation_date TEXT,
+      renewal_date TEXT, remark TEXT, synced_at TEXT NOT NULL)""")
     conn.commit(); return conn
 
 def respond(h,code,payload):
@@ -247,38 +257,38 @@ def read_json(h):
     except Exception: return None
 
 def local_license_metadata(serial):
-    """Read authoritative license metadata from License Management Pro DB when available.
-    This is read-only; it never creates, edits, or deletes license-management data.
-    """
+    """Read LMP metadata locally, or from the authenticated Render sync mirror."""
+    serial = str(serial or "").strip().upper()
     try:
-        if not os.path.exists(LICENSE_DB_PATH):
-            return {}
-        conn=sqlite3.connect(LICENSE_DB_PATH)
-        conn.row_factory=sqlite3.Row
-        row=conn.execute("SELECT * FROM licenses WHERE UPPER(TRIM(license_key))=? LIMIT 1",(serial.upper(),)).fetchone()
-        if not row:
-            conn.close()
-            return {}
-        d=dict(row)
-        renewal_row=conn.execute(
-            "SELECT renew_date FROM renewal_history WHERE license_id=? ORDER BY id DESC LIMIT 1",
-            (row["id"],),
-        ).fetchone()
-        conn.close()
-        out={}
-        for key in ("customer_name","product_name","issue_date","expiry_date","license_duration","client_code","license_count","status","activation_date"):
-            value=d.get(key)
-            if value is not None and str(value).strip() != "":
-                out[key]=str(value).strip()
-        if renewal_row and renewal_row["renew_date"]:
-            out["renewal_date"]=str(renewal_row["renew_date"]).strip()
-        if out.get("license_count"):
-            try: out["license_count"]=max(1,int(float(out["license_count"])))
-            except Exception: out.pop("license_count",None)
-        return out
+        if os.path.exists(LICENSE_DB_PATH):
+            conn = sqlite3.connect(LICENSE_DB_PATH)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute("SELECT * FROM licenses WHERE UPPER(TRIM(license_key))=? LIMIT 1", (serial,)).fetchone()
+                if row:
+                    d = dict(row)
+                    renewal_row = conn.execute("SELECT renew_date FROM renewal_history WHERE license_id=? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
+                    out = {k: str(d[k]).strip() for k in ("customer_name","product_name","issue_date","expiry_date","license_duration","client_code","license_count","status","activation_date") if d.get(k) is not None and str(d[k]).strip()}
+                    if renewal_row and renewal_row["renew_date"]: out["renewal_date"] = str(renewal_row["renew_date"]).strip()
+                    if out.get("license_count"):
+                        try: out["license_count"] = max(1, int(float(out["license_count"])))
+                        except Exception: out.pop("license_count", None)
+                    return out
+            finally:
+                conn.close()
+    except Exception:
+        pass
+    try:
+        conn = db()
+        try:
+            row = conn.execute("""SELECT customer_name,product_name,issue_date,expiry_date,license_duration,
+                client_code,license_count,status,activation_date,renewal_date FROM lmp_license_mirror
+                WHERE UPPER(TRIM(license_key))=? LIMIT 1""", (serial,)).fetchone()
+            if not row: return {}
+            return {k: v for k, v in dict(row).items() if v is not None and str(v).strip()}
+        finally: conn.close()
     except Exception:
         return {}
-
 
 def merge_license_metadata(item, serial):
     meta=local_license_metadata(serial)
@@ -622,6 +632,39 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 print(f"[account-import] status=500 exception={type(exc).__name__}", flush=True)
                 return respond(self,500,{"ok":False,"error":"account import failed; inspect server logs","reason":"internal_error"})
+        if parsed.path == "/v1/lmp/licenses/sync":
+            supplied = str(payload.get("sync_token") or "").strip()
+            if not LMP_SYNC_TOKEN or not hmac.compare_digest(supplied, LMP_SYNC_TOKEN):
+                return respond(self, 401, {"ok": False, "error": "LMP sync authorization required"})
+            operation = str(payload.get("operation") or "upsert").strip().lower()
+            serial = _safe_text(payload.get("license_key"), 80).upper().replace(" ", "")
+            if not serial or not re.fullmatch(r"[A-Z0-9]{20}", serial):
+                return respond(self, 400, {"ok": False, "error": "valid license_key is required"})
+            conn = db()
+            try:
+                if operation == "delete":
+                    conn.execute("DELETE FROM lmp_license_mirror WHERE license_key=?", (serial,))
+                    conn.commit()
+                    return respond(self, 200, {"ok": True, "operation": "delete", "license_key": serial})
+                try: count_value = max(1, int(float(payload.get("license_count") or 1)))
+                except (TypeError, ValueError): count_value = 1
+                values = (serial, _safe_text(payload.get("customer_name"),200), _safe_text(payload.get("product_name"),200),
+                    _safe_text(payload.get("issue_date"),100), _safe_text(payload.get("expiry_date"),100),
+                    _safe_text(payload.get("license_duration"),100), _safe_text(payload.get("client_code"),120),
+                    count_value, _safe_text(payload.get("status"),30), _safe_text(payload.get("activation_date"),100),
+                    _safe_text(payload.get("renewal_date"),100), _safe_text(payload.get("remark"),1000), utc_now())
+                conn.execute("""INSERT INTO lmp_license_mirror
+                    (license_key,customer_name,product_name,issue_date,expiry_date,license_duration,client_code,
+                     license_count,status,activation_date,renewal_date,remark,synced_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(license_key) DO UPDATE SET customer_name=excluded.customer_name,
+                     product_name=excluded.product_name,issue_date=excluded.issue_date,expiry_date=excluded.expiry_date,
+                     license_duration=excluded.license_duration,client_code=excluded.client_code,
+                     license_count=excluded.license_count,status=excluded.status,activation_date=excluded.activation_date,
+                     renewal_date=excluded.renewal_date,remark=excluded.remark,synced_at=excluded.synced_at""", values)
+                conn.commit()
+                return respond(self, 200, {"ok": True, "operation": "upsert", "license_key": serial})
+            finally: conn.close()
         if parsed.path == "/v1/accounts/signup":
             code,result=save_client_signup(payload); return respond(self,code,result)
         if parsed.path == "/v1/accounts/forgot-username":
