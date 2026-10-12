@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-import-fix-20261012-3"
+BUILD_ID="dpm-account-recovery-import-fix-20261012-4"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -553,7 +553,12 @@ def save_client_log(payload):
     finally: conn.close()
 
 def admin_authorized(handler):
-    supplied=handler.headers.get("X-DPM-Admin-Token","")
+    # Prefer the standard Authorization header; retain the legacy header for compatibility.
+    supplied=handler.headers.get("Authorization","")
+    if supplied.lower().startswith("bearer "):
+        supplied=supplied[7:].strip()
+    else:
+        supplied=handler.headers.get("X-DPM-Admin-Token","")
     return bool(ADMIN_RESET_TOKEN) and hmac.compare_digest(supplied,ADMIN_RESET_TOKEN)
 
 class Handler(BaseHTTPRequestHandler):
