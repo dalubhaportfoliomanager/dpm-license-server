@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-account-recovery-diagnostic-20261012-1"
+BUILD_ID="dpm-lmp-mirror-priority-fix-20261012-1"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -257,8 +257,27 @@ def read_json(h):
     except Exception: return None
 
 def local_license_metadata(serial):
-    """Read LMP metadata locally, or from the authenticated Render sync mirror."""
-    serial = str(serial or "").strip().upper()
+    """Read latest authenticated LMP sync metadata first; use local LMP SQLite only as fallback.
+
+    The Render PostgreSQL mirror is refreshed by LMP sync. A stale SQLite copy
+    must not override newer expiry/status values already synced from LMP.
+    """
+    serial = str(serial or "").strip().upper().replace(" ", "")
+    try:
+        conn = db()
+        try:
+            row = conn.execute("""SELECT customer_name,product_name,issue_date,expiry_date,license_duration,
+                client_code,license_count,status,activation_date,renewal_date FROM lmp_license_mirror
+                WHERE UPPER(TRIM(license_key))=? LIMIT 1""", (serial,)).fetchone()
+            if row:
+                mirror = {k: v for k, v in dict(row).items() if v is not None and str(v).strip()}
+                if mirror:
+                    return mirror
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[lmp-metadata] mirror_read_failed error={type(exc).__name__}", flush=True)
+
     try:
         if os.path.exists(LICENSE_DB_PATH):
             conn = sqlite3.connect(LICENSE_DB_PATH)
@@ -269,26 +288,19 @@ def local_license_metadata(serial):
                     d = dict(row)
                     renewal_row = conn.execute("SELECT renew_date FROM renewal_history WHERE license_id=? ORDER BY id DESC LIMIT 1", (row["id"],)).fetchone()
                     out = {k: str(d[k]).strip() for k in ("customer_name","product_name","issue_date","expiry_date","license_duration","client_code","license_count","status","activation_date") if d.get(k) is not None and str(d[k]).strip()}
-                    if renewal_row and renewal_row["renew_date"]: out["renewal_date"] = str(renewal_row["renew_date"]).strip()
+                    if renewal_row and renewal_row["renew_date"]:
+                        out["renewal_date"] = str(renewal_row["renew_date"]).strip()
                     if out.get("license_count"):
-                        try: out["license_count"] = max(1, int(float(out["license_count"])))
-                        except Exception: out.pop("license_count", None)
+                        try:
+                            out["license_count"] = max(1, int(float(out["license_count"])))
+                        except Exception:
+                            out.pop("license_count", None)
                     return out
             finally:
                 conn.close()
-    except Exception:
-        pass
-    try:
-        conn = db()
-        try:
-            row = conn.execute("""SELECT customer_name,product_name,issue_date,expiry_date,license_duration,
-                client_code,license_count,status,activation_date,renewal_date FROM lmp_license_mirror
-                WHERE UPPER(TRIM(license_key))=? LIMIT 1""", (serial,)).fetchone()
-            if not row: return {}
-            return {k: v for k, v in dict(row).items() if v is not None and str(v).strip()}
-        finally: conn.close()
-    except Exception:
-        return {}
+    except Exception as exc:
+        print(f"[lmp-metadata] local_db_read_failed error={type(exc).__name__}", flush=True)
+    return {}
 
 def merge_license_metadata(item, serial):
     meta=local_license_metadata(serial)
