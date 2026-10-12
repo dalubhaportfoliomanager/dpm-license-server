@@ -489,6 +489,47 @@ def save_client_signup(payload):
     finally:
         conn.close()
 
+def import_local_account(payload):
+    """Restore an existing local DPM account. Admin-token protected; never overwrites."""
+    username=_safe_text(payload.get("username"),120)
+    email=_safe_text(payload.get("email"),254).lower()
+    license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
+    full_name=_safe_text(payload.get("full_name") or payload.get("fullName") or username,200)
+    password=str(payload.get("password") or "")
+    answers=payload.get("secret_answers") or payload.get("secretAnswers") or []
+    questions=payload.get("secret_questions") or payload.get("secretQuestions") or []
+    if not username or not email or "@" not in email or not license_id or not full_name or len(password)<6:
+        return 400,{"ok":False,"error":"required account fields missing"}
+    if not isinstance(answers,list) or len(answers)<3 or any(not str(x or "").strip() for x in answers[:3]):
+        return 400,{"ok":False,"error":"three security answers are required"}
+    if not isinstance(questions,list) or len(questions)<3:
+        return 400,{"ok":False,"error":"three security questions are required"}
+    now=utc_now(); conn=db()
+    try:
+        existing=conn.execute("SELECT id FROM client_accounts WHERE LOWER(TRIM(email))=? OR LOWER(TRIM(username))=LOWER(TRIM(?)) OR UPPER(TRIM(license_id))=? LIMIT 1",(email,username,license_id)).fetchone()
+        if existing:
+            return 200,{"ok":True,"imported":False,"skipped":True,"reason":"account_field_already_exists"}
+        conn.execute("""INSERT INTO client_accounts
+          (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT DO NOTHING""",
+          (username,email,license_id,full_name,_safe_text(payload.get("mobile"),40),_safe_text(payload.get("dob"),80),
+           _safe_text(payload.get("account_name") or payload.get("accountName") or username,120),
+           _safe_text(payload.get("broker"),120),_safe_text(payload.get("client_code") or payload.get("clientCode"),120),
+           _safe_text(payload.get("address"),500),_safe_text(payload.get("bo_id") or payload.get("boId"),100),
+           _safe_text(payload.get("pan"),30),_safe_text(payload.get("dp_name") or payload.get("dpName"),200),
+           _safe_text(payload.get("segments"),500),_safe_text(payload.get("otp_method") or payload.get("otpMethod") or "email",30),
+           json.dumps(questions[:3]),_password_hash(password),_answers_hash(answers[:3]),now,now))
+        conn.commit()
+        row=conn.execute("SELECT id FROM client_accounts WHERE LOWER(TRIM(email))=? AND LOWER(TRIM(username))=LOWER(TRIM(?))",(email,username)).fetchone()
+        if row: return 201,{"ok":True,"imported":True,"username":username}
+        return 200,{"ok":True,"imported":False,"skipped":True,"reason":"unique_constraint_conflict"}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def save_client_log(payload):
     # Deliberately reject common secret fields; logs must never receive passwords/answers.
     if any(k.lower() in {"password","confirm_password","secret_answers","secretanswers","token","api_key"} for k in payload):
@@ -547,6 +588,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed=urlparse(self.path); payload=read_json(self)
         if payload is None: return respond(self,400,{"ok":False,"error":"invalid JSON"})
+        if parsed.path == "/v1/admin/import-local-accounts":
+            if not admin_authorized(self): return respond(self,401,{"ok":False,"error":"admin authorization required"})
+            code,result=import_local_account(payload); return respond(self,code,result)
         if parsed.path == "/v1/accounts/signup":
             code,result=save_client_signup(payload); return respond(self,code,result)
         if parsed.path == "/v1/accounts/forgot-username":
