@@ -485,14 +485,32 @@ def _answers_hash(value):
     return _password_hash(normalized)
 
 def _credential_cipher():
-    """Load the admin-only credential vault key from the Render environment."""
+    """Load a Fernet key, also accepting a 64-character hex-encoded 32-byte secret.
+
+    Existing valid Fernet keys are used unchanged. A hex secret is decoded to
+    32 raw bytes and URL-safe-base64 encoded, yielding a deterministic Fernet key.
+    The secret itself is never logged or returned to clients.
+    """
     key = os.environ.get("DPM_CREDENTIAL_ENCRYPTION_KEY", "").strip()
     if not key:
         raise RuntimeError("DPM_CREDENTIAL_ENCRYPTION_KEY is not configured")
     try:
-        return Fernet(key.encode("ascii"))
+        # Preserve compatibility with the standard Fernet format first.
+        try:
+            return Fernet(key.encode("ascii"))
+        except (ValueError, UnicodeEncodeError):
+            pass
+        # Render environment values are sometimes generated as `openssl rand -hex 32`.
+        # Support that representation without requiring users to replace the secret.
+        if len(key) == 64 and re.fullmatch(r"[0-9a-fA-F]{64}", key):
+            import base64
+            raw = bytes.fromhex(key)
+            return Fernet(base64.urlsafe_b64encode(raw))
+        raise ValueError("unsupported key format")
     except Exception as exc:
-        raise RuntimeError("DPM_CREDENTIAL_ENCRYPTION_KEY must be a valid Fernet key") from exc
+        raise RuntimeError(
+            "DPM_CREDENTIAL_ENCRYPTION_KEY must be a valid Fernet key or a 64-character hex secret"
+        ) from exc
 
 def _encrypt_credentials(password, answers):
     payload = json.dumps({"password": str(password), "secret_answers": [str(x) for x in answers[:3]]},
