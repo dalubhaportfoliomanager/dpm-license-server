@@ -1,3 +1,4 @@
 # Dependencies for dpm-license-server
-# Python standard library plus PostgreSQL driver.
+# PostgreSQL driver and credential encryption support.
 psycopg[binary]>=3.2.9,<4
+cryptography>=42.0.0
