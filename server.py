@@ -577,7 +577,7 @@ def save_client_signup(payload):
            _safe_text(payload.get("dp_name") or payload.get("dpName"),200),_safe_text(payload.get("segments"),500),
            _safe_text(payload.get("otp_method") or payload.get("otpMethod"),30),
            json.dumps(payload.get("secret_questions") or payload.get("secretQuestions") or []),
-           _password_hash(password),_answers_hash(answers[:3]),now,now))
+           _password_hash(password),_answers_hash(answers[:3]),encrypted_credentials,now,now))
         conn.commit()
         return 201,{"ok":True,"username":username,"license_id":license_id,"created_at":now}
     except Exception as exc:
