@@ -796,6 +796,66 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
         if parsed.path == "/v1/accounts/signup":
             code,result=save_client_signup(payload); return respond(self,code,result)
+        if parsed.path == "/v1/accounts/recovery-question":
+            username = _safe_text(payload.get("username"), 120).strip()
+            if not username:
+                return respond(self, 400, {"ok": False, "error": "Enter your username."})
+            conn = db()
+            try:
+                row = conn.execute("SELECT username, secret_questions_json FROM client_accounts WHERE LOWER(TRIM(username))=LOWER(TRIM(?)) LIMIT 1", (username,)).fetchone()
+                if not row:
+                    return respond(self, 404, {"ok": False, "error": "No central account found for this username."})
+                try:
+                    questions = json.loads(row["secret_questions_json"] or "[]")
+                except (TypeError, ValueError):
+                    questions = []
+                if not isinstance(questions, list) or len(questions) < 3 or any(not str(q or "").strip() for q in questions[:3]):
+                    return respond(self, 409, {"ok": False, "error": "Security questions are not available for this account."})
+                index = secrets.randbelow(3)
+                return respond(self, 200, {"ok": True, "username": row["username"], "question_index": index, "question": str(questions[index])})
+            finally:
+                conn.close()
+        if parsed.path == "/v1/accounts/forgot-password":
+            username = _safe_text(payload.get("username"), 120).strip()
+            question_index = payload.get("question_index")
+            answer = _safe_text(payload.get("answer"), 1000).strip().casefold()
+            new_password = str(payload.get("new_password") or "")
+            try:
+                question_index = int(question_index)
+            except (TypeError, ValueError):
+                question_index = -1
+            if not username or question_index not in (0, 1, 2) or not answer:
+                return respond(self, 400, {"ok": False, "error": "Username, security answer, and selected question are required."})
+            if len(new_password) < 6:
+                return respond(self, 400, {"ok": False, "error": "New password must be at least 6 characters."})
+            conn = db()
+            try:
+                row = conn.execute("SELECT id, secret_questions_json, credential_vault FROM client_accounts WHERE LOWER(TRIM(username))=LOWER(TRIM(?)) LIMIT 1", (username,)).fetchone()
+                if not row:
+                    return respond(self, 404, {"ok": False, "error": "No central account found for this username."})
+                try:
+                    questions = json.loads(row["secret_questions_json"] or "[]")
+                except (TypeError, ValueError):
+                    questions = []
+                if not isinstance(questions, list) or len(questions) <= question_index:
+                    return respond(self, 409, {"ok": False, "error": "Security questions are not available for this account."})
+                vault = _decrypt_credentials(row["credential_vault"])
+                answers = vault.get("secret_answers", [])
+                if len(answers) < 3 or not hmac.compare_digest(str(answers[question_index]).strip().casefold(), answer):
+                    return respond(self, 401, {"ok": False, "error": "Incorrect security answer."})
+                try:
+                    encrypted = _encrypt_credentials(new_password, answers[:3])
+                except Exception:
+                    return respond(self, 503, {"ok": False, "error": "Secure credential vault is unavailable. Contact the administrator."})
+                conn.execute("UPDATE client_accounts SET password_hash=?, credential_vault=?, updated_at=? WHERE id=?", (_password_hash(new_password), encrypted, utc_now(), row["id"]))
+                conn.commit()
+                print("[account-recovery] password_reset=completed", flush=True)
+                return respond(self, 200, {"ok": True, "message": "Password reset successfully."})
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
         if parsed.path == "/v1/accounts/forgot-username":
             # Exact registered-email lookup against the central account database.
             # Do not expose account data beyond the username needed for recovery.
@@ -808,9 +868,9 @@ class Handler(BaseHTTPRequestHandler):
                 row=conn.execute("SELECT username FROM client_accounts WHERE LOWER(TRIM(email))=? LIMIT 1",(email,)).fetchone()
                 account_count=get_client_account_count(conn)
                 if not row:
-                    print(f"[account-recovery] result=not_found db={os.path.abspath(DB_PATH)!r} central_account_count={account_count}", flush=True)
+                    print(f"[account-recovery] result=not_found db={("postgresql" if DATABASE_URL else os.path.abspath(DB_PATH))!r} central_account_count={account_count}", flush=True)
                     return respond(self,404,{"ok":False,"error":"No central account found with this email.","reason":"account_not_found"})
-                print(f"[account-recovery] result=found db={os.path.abspath(DB_PATH)!r} central_account_count={account_count}", flush=True)
+                print(f"[account-recovery] result=found db={("postgresql" if DATABASE_URL else os.path.abspath(DB_PATH))!r} central_account_count={account_count}", flush=True)
                 return respond(self,200,{"ok":True,"username":row["username"]})
             finally:
                 conn.close()
