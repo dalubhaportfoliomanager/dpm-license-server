@@ -2,11 +2,12 @@
 """Dalubha Portfolio Manager central license/account tracker (SQLite or PostgreSQL)."""
 from __future__ import annotations
 import json, os, re, sqlite3, hashlib, secrets, hmac
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-lmp-mirror-priority-fix-20261012-1"
+BUILD_ID="dpm-lmp-credential-vault-20261013-1"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -240,6 +241,12 @@ def db():
           issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
           license_count INTEGER NOT NULL DEFAULT 1, status TEXT, activation_date TEXT,
           renewal_date TEXT, remark TEXT, synced_at TEXT NOT NULL)""")
+        # Additive PostgreSQL migration; existing account rows remain untouched.
+        column = conn.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='client_accounts' AND column_name='credential_vault'"
+        ).fetchone()
+        if not column:
+            conn.execute("ALTER TABLE client_accounts ADD COLUMN credential_vault TEXT")
         conn.commit()
         return conn
 
@@ -271,6 +278,12 @@ def db():
       issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
       license_count INTEGER NOT NULL DEFAULT 1, status TEXT, activation_date TEXT,
       renewal_date TEXT, remark TEXT, synced_at TEXT NOT NULL)""")
+    # Additive SQLite migration for existing central databases.
+    try:
+        conn.execute("ALTER TABLE client_accounts ADD COLUMN credential_vault TEXT")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
     conn.commit(); return conn
 
 def respond(h,code,payload):
@@ -471,6 +484,34 @@ def _answers_hash(value):
     normalized="|".join(str(x or "").strip().casefold() for x in (value if isinstance(value,list) else []))
     return _password_hash(normalized)
 
+def _credential_cipher():
+    """Load the admin-only credential vault key from the Render environment."""
+    key = os.environ.get("DPM_CREDENTIAL_ENCRYPTION_KEY", "").strip()
+    if not key:
+        raise RuntimeError("DPM_CREDENTIAL_ENCRYPTION_KEY is not configured")
+    try:
+        return Fernet(key.encode("ascii"))
+    except Exception as exc:
+        raise RuntimeError("DPM_CREDENTIAL_ENCRYPTION_KEY must be a valid Fernet key") from exc
+
+def _encrypt_credentials(password, answers):
+    payload = json.dumps({"password": str(password), "secret_answers": [str(x) for x in answers[:3]]},
+                         ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return _credential_cipher().encrypt(payload).decode("ascii")
+
+def _decrypt_credentials(value):
+    if not value:
+        return {}
+    try:
+        decoded = _credential_cipher().decrypt(str(value).encode("ascii"), ttl=None)
+        data = json.loads(decoded.decode("utf-8"))
+        if isinstance(data, dict):
+            return {"password": str(data.get("password") or ""),
+                    "secret_answers": data.get("secret_answers") if isinstance(data.get("secret_answers"), list) else []}
+    except (InvalidToken, ValueError, TypeError, RuntimeError):
+        return {}
+    return {}
+
 def _safe_text(value, limit=4000):
     return str(value or "").strip()[:limit]
 
@@ -490,6 +531,14 @@ def save_client_signup(payload):
         return 400,{"ok":False,"error":"required signup fields missing","reason":"required_fields"}
     if not isinstance(answers,list) or len(answers)<3 or any(not str(x or "").strip() for x in answers[:3]):
         return 400,{"ok":False,"error":"three security answers are required","reason":"security_answers_required"}
+
+    # Future signup credentials must be recoverable for authorized LMP support.
+    # Refuse to create a new central record unless the encryption key is configured.
+    try:
+        _credential_cipher()
+        encrypted_credentials = _encrypt_credentials(password, answers[:3])
+    except Exception as exc:
+        return 503,{"ok":False,"error":"Secure credential vault is not configured on the central server. Contact the administrator.","reason":"credential_vault_unavailable"}
 
     # Never trust the client-provided License ID alone. LMP must be reachable
     # and contain an active, unexpired license before new signup is accepted.
@@ -519,8 +568,8 @@ def save_client_signup(payload):
             return 409,{"ok":False,"error":"This email is already registered. Please Login or use Forgot Username/Password.","reason":"email_exists"}
 
         conn.execute("""INSERT INTO client_accounts
-          (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,credential_vault,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
           (username,email,license_id,full_name,_safe_text(payload.get("mobile"),40),_safe_text(payload.get("dob"),80),
            _safe_text(payload.get("account_name") or payload.get("accountName"),120),_safe_text(payload.get("broker"),120),
            _safe_text(payload.get("client_code") or payload.get("clientCode"),120),_safe_text(payload.get("address"),500),
@@ -554,14 +603,18 @@ def import_local_account(payload):
         return 400,{"ok":False,"error":"three security answers are required"}
     if not isinstance(questions,list) or len(questions)<3:
         return 400,{"ok":False,"error":"three security questions are required"}
+    try:
+        encrypted_credentials = _encrypt_credentials(password, answers[:3])
+    except Exception:
+        encrypted_credentials = None
     now=utc_now(); conn=db()
     try:
         existing=conn.execute("SELECT id FROM client_accounts WHERE LOWER(TRIM(email))=? OR LOWER(TRIM(username))=LOWER(TRIM(?)) OR UPPER(TRIM(license_id))=? LIMIT 1",(email,username,license_id)).fetchone()
         if existing:
             return 200,{"ok":True,"imported":False,"skipped":True,"reason":"account_field_already_exists"}
         conn.execute("""INSERT INTO client_accounts
-          (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,created_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          (username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,password_hash,secret_answers_hash,credential_vault,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
           ON CONFLICT DO NOTHING""",
           (username,email,license_id,full_name,_safe_text(payload.get("mobile"),40),_safe_text(payload.get("dob"),80),
            _safe_text(payload.get("account_name") or payload.get("accountName") or username,120),
@@ -569,7 +622,7 @@ def import_local_account(payload):
            _safe_text(payload.get("address"),500),_safe_text(payload.get("bo_id") or payload.get("boId"),100),
            _safe_text(payload.get("pan"),30),_safe_text(payload.get("dp_name") or payload.get("dpName"),200),
            _safe_text(payload.get("segments"),500),_safe_text(payload.get("otp_method") or payload.get("otpMethod") or "email",30),
-           json.dumps(questions[:3]),_password_hash(password),_answers_hash(answers[:3]),now,now))
+           json.dumps(questions[:3]),_password_hash(password),_answers_hash(answers[:3]),encrypted_credentials,now,now))
         conn.commit()
         row=conn.execute("SELECT id FROM client_accounts WHERE LOWER(TRIM(email))=? AND LOWER(TRIM(username))=LOWER(TRIM(?))",(email,username)).fetchone()
         if row: return 201,{"ok":True,"imported":True,"username":username}
@@ -646,11 +699,16 @@ class Handler(BaseHTTPRequestHandler):
                 return respond(self, 400, {"ok": False, "error": "license_id is required"})
             conn = db()
             try:
-                fields = "id,username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,created_at,updated_at"
+                fields = "id,username,email,license_id,full_name,mobile,dob,account_name,broker,client_code,address,bo_id,pan,dp_name,segments,otp_method,secret_questions_json,credential_vault,created_at,updated_at"
                 row = conn.execute(f"SELECT {fields} FROM client_accounts WHERE UPPER(TRIM(license_id))=? ORDER BY id DESC LIMIT 1", (serial,)).fetchone()
                 if not row:
                     return respond(self, 404, {"ok": False, "error": "No DPM signup found for this license"})
-                return respond(self, 200, {"ok": True, "item": dict(row)})
+                item = dict(row)
+                vault = _decrypt_credentials(item.pop("credential_vault", None))
+                item["support_password"] = vault.get("password", "")
+                item["support_secret_answers"] = vault.get("secret_answers", [])
+                item["credentials_available"] = bool(vault.get("password")) and len(vault.get("secret_answers", [])) == 3
+                return respond(self, 200, {"ok": True, "item": item})
             finally:
                 conn.close()
         if parsed.path=="/v1/activation/status":
@@ -717,16 +775,20 @@ class Handler(BaseHTTPRequestHandler):
                 return respond(self, 400, {"ok": False, "error": "New password must be at least 8 characters"})
             if not isinstance(answers, list) or len(answers) != 3 or any(not str(x or "").strip() for x in answers):
                 return respond(self, 400, {"ok": False, "error": "Enter all three new security answers"})
+            try:
+                encrypted_credentials = _encrypt_credentials(new_password, answers)
+            except Exception:
+                return respond(self, 503, {"ok": False, "error": "Secure credential vault is not configured on the central server"})
             conn = db()
             try:
                 row = conn.execute("SELECT id FROM client_accounts WHERE UPPER(TRIM(license_id))=? ORDER BY id DESC LIMIT 1", (serial,)).fetchone()
                 if not row:
                     return respond(self, 404, {"ok": False, "error": "No DPM account found for this license"})
-                conn.execute("UPDATE client_accounts SET password_hash=?, secret_answers_hash=?, updated_at=? WHERE id=?",
-                             (_password_hash(new_password), _answers_hash(answers), utc_now(), row["id"]))
+                conn.execute("UPDATE client_accounts SET password_hash=?, secret_answers_hash=?, credential_vault=?, updated_at=? WHERE id=?",
+                             (_password_hash(new_password), _answers_hash(answers), encrypted_credentials, utc_now(), row["id"]))
                 conn.commit()
                 print(f"[credential-reset] completed license_suffix={serial[-4:]}", flush=True)
-                return respond(self, 200, {"ok": True, "message": "Password and security answers were reset. Save them securely; they cannot be viewed later."})
+                return respond(self, 200, {"ok": True, "message": "Password and security answers were reset and securely saved for authorized LMP support."})
             except Exception:
                 conn.rollback()
                 raise
