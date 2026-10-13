@@ -703,6 +703,35 @@ class Handler(BaseHTTPRequestHandler):
                 conn.commit()
                 return respond(self, 200, {"ok": True, "operation": "upsert", "license_key": serial})
             finally: conn.close()
+        if parsed.path == "/v1/lmp/licenses/reset-credentials":
+            # Explicit LMP-admin initiated reset. Never return plaintext credentials.
+            supplied = self.headers.get("X-DPM-LMP-Sync-Token", "")
+            if not LMP_SYNC_TOKEN or not hmac.compare_digest(supplied, LMP_SYNC_TOKEN):
+                return respond(self, 401, {"ok": False, "error": "LMP authorization required"})
+            serial = _safe_text(payload.get("license_id") or payload.get("licenseId"), 80).upper()
+            new_password = str(payload.get("new_password") or "")
+            answers = payload.get("secret_answers") or payload.get("secretAnswers") or []
+            if not serial:
+                return respond(self, 400, {"ok": False, "error": "license_id is required"})
+            if len(new_password) < 8:
+                return respond(self, 400, {"ok": False, "error": "New password must be at least 8 characters"})
+            if not isinstance(answers, list) or len(answers) != 3 or any(not str(x or "").strip() for x in answers):
+                return respond(self, 400, {"ok": False, "error": "Enter all three new security answers"})
+            conn = db()
+            try:
+                row = conn.execute("SELECT id FROM client_accounts WHERE UPPER(TRIM(license_id))=? ORDER BY id DESC LIMIT 1", (serial,)).fetchone()
+                if not row:
+                    return respond(self, 404, {"ok": False, "error": "No DPM account found for this license"})
+                conn.execute("UPDATE client_accounts SET password_hash=?, secret_answers_hash=?, updated_at=? WHERE id=?",
+                             (_password_hash(new_password), _answers_hash(answers), utc_now(), row["id"]))
+                conn.commit()
+                print(f"[credential-reset] completed license_suffix={serial[-4:]}", flush=True)
+                return respond(self, 200, {"ok": True, "message": "Password and security answers were reset. Save them securely; they cannot be viewed later."})
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
         if parsed.path == "/v1/accounts/signup":
             code,result=save_client_signup(payload); return respond(self,code,result)
         if parsed.path == "/v1/accounts/forgot-username":
