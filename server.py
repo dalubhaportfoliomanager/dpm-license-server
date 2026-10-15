@@ -934,11 +934,11 @@ class Handler(BaseHTTPRequestHandler):
         return respond(self,404,{"ok":False,"error":"not found"})
 
 if __name__=="__main__":
-    _startup_conn=db()
-    try:
-        _account_count=get_client_account_count(_startup_conn)
-    finally:
-        _startup_conn.close()
+    # Bind the Render-assigned port before touching PostgreSQL. Render's health
+    # scanner must see a listening socket even if the database is temporarily slow.
     database_label=("PostgreSQL (DATABASE_URL configured)" if DATABASE_URL else os.path.abspath(DB_PATH))
-    print(f"DPM License Tracker build={BUILD_ID} listening on http://{HOST}:{PORT}; database={database_label!r}; central_accounts={_account_count}", flush=True)
-    ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+    httpd=ThreadingHTTPServer((HOST,PORT),Handler)
+    print(f"DPM License Tracker build={BUILD_ID} listening on http://{HOST}:{PORT}; database={database_label!r}; startup_db_check=deferred", flush=True)
+    # Do not block port binding on a database warm-up/count query. Individual
+    # database-backed requests still call db() and will log their actual errors.
+    httpd.serve_forever()
