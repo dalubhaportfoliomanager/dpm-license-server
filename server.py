@@ -216,7 +216,7 @@ def db():
         # PostgreSQL-compatible schema; account data persists in the managed database.
         conn.execute("""CREATE TABLE IF NOT EXISTS activations(
           id BIGSERIAL PRIMARY KEY, serial TEXT NOT NULL, client_code TEXT NOT NULL,
-          customer_name TEXT, device_id TEXT NOT NULL, activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+          customer_name TEXT, device_id TEXT NOT NULL, hdd_id TEXT NOT NULL DEFAULT '', activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
           app_version TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE', license_count INTEGER NOT NULL,
           expiry_date TEXT NOT NULL, first_ip TEXT, last_ip TEXT, UNIQUE(serial,device_id))""")
         conn.execute("""CREATE TABLE IF NOT EXISTS license_usage(
@@ -236,6 +236,9 @@ def db():
           message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
           app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
           metadata_json TEXT)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS hardware_reset_audit(
+          id BIGSERIAL PRIMARY KEY, serial TEXT NOT NULL, reason TEXT NOT NULL,
+          reset_at TEXT NOT NULL, prior_device_ids TEXT, prior_hdd_ids TEXT)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS lmp_license_mirror(
           license_key TEXT PRIMARY KEY, customer_name TEXT, product_name TEXT,
           issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
@@ -247,13 +250,19 @@ def db():
         ).fetchone()
         if not column:
             conn.execute("ALTER TABLE client_accounts ADD COLUMN credential_vault TEXT")
+        # Additive migration: keep all existing activation/account rows intact.
+        try:
+            conn.execute("ALTER TABLE activations ADD COLUMN hdd_id TEXT NOT NULL DEFAULT ''")
+        except Exception as exc:
+            if "duplicate column" not in str(exc).lower() and "already exists" not in str(exc).lower():
+                raise
         conn.commit()
         return conn
 
     conn=sqlite3.connect(DB_PATH); conn.row_factory=sqlite3.Row
     conn.execute("""CREATE TABLE IF NOT EXISTS activations(
       id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT NOT NULL, client_code TEXT NOT NULL,
-      customer_name TEXT, device_id TEXT NOT NULL, activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
+      customer_name TEXT, device_id TEXT NOT NULL, hdd_id TEXT NOT NULL DEFAULT '', activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
       app_version TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE', license_count INTEGER NOT NULL,
       expiry_date TEXT NOT NULL, first_ip TEXT, last_ip TEXT, UNIQUE(serial,device_id))""")
     conn.execute("""CREATE TABLE IF NOT EXISTS license_usage(
@@ -273,6 +282,9 @@ def db():
       message TEXT NOT NULL, stack_trace TEXT, last_success_step TEXT,
       app_version TEXT, client_time TEXT, server_time TEXT NOT NULL,
       metadata_json TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS hardware_reset_audit(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, serial TEXT NOT NULL, reason TEXT NOT NULL,
+      reset_at TEXT NOT NULL, prior_device_ids TEXT, prior_hdd_ids TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS lmp_license_mirror(
       license_key TEXT PRIMARY KEY, customer_name TEXT, product_name TEXT,
       issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
@@ -281,6 +293,11 @@ def db():
     # Additive SQLite migration for existing central databases.
     try:
         conn.execute("ALTER TABLE client_accounts ADD COLUMN credential_vault TEXT")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
+    try:
+        conn.execute("ALTER TABLE activations ADD COLUMN hdd_id TEXT NOT NULL DEFAULT ''")
     except sqlite3.OperationalError as exc:
         if "duplicate column" not in str(exc).lower():
             raise
@@ -354,7 +371,7 @@ def merge_license_metadata(item, serial):
 
 
 def register(payload,ip):
-    serial=str(payload.get("serial","")).strip().upper(); device=str(payload.get("device_id","")).strip()
+    serial=str(payload.get("serial","")).strip().upper(); device=str(payload.get("device_id","")).strip(); hdd=str(payload.get("hdd_id") or payload.get("hard_disk_serial") or payload.get("hdd_serial") or "").strip()
     customer=str(payload.get("customer_name","")).strip(); version=str(payload.get("app_version","")).strip()
     decoded=decode_serial(serial)
     meta=local_license_metadata(serial)
@@ -364,6 +381,7 @@ def register(payload,ip):
         if meta.get("license_count") is not None: decoded["license_count"]=meta["license_count"]
         if meta.get("expiry_date"): decoded["expiry_date"]=meta["expiry_date"]
     if not serial or not device: return 400,{"ok":False,"error":"serial and device_id are required"}
+    if not hdd: return 400,{"ok":False,"error":"HDD serial could not be read; hardware binding cannot be verified","reason":"hdd_id_unavailable"}
     if not decoded: return 400,{"ok":False,"error":"invalid serial"}
 
     # SECURITY RULE: a syntactically valid DMP...LMP##### string is NOT a license.
@@ -387,54 +405,59 @@ def register(payload,ip):
     license_count=int(meta.get("license_count") or decoded.get("license_count") or 1)
     if license_count < 1: license_count=1
 
-    existing=conn.execute("SELECT id,activated_at FROM activations WHERE serial=? AND device_id=?",(serial,device)).fetchone()
-    other=conn.execute("SELECT id,device_id FROM activations WHERE serial=? AND device_id<>? AND status='ACTIVE' ORDER BY id DESC LIMIT 1",(serial,device)).fetchone()
+    existing=conn.execute("SELECT id,activated_at,hdd_id FROM activations WHERE serial=? AND device_id=?",(serial,device)).fetchone()
+    other=conn.execute("SELECT id,device_id,hdd_id FROM activations WHERE serial=? AND status='ACTIVE' ORDER BY id DESC LIMIT 1",(serial,device)).fetchone()
     usage=conn.execute("SELECT activation_count FROM license_usage WHERE serial=?",(serial,)).fetchone()
     used_count=int(usage["activation_count"]) if usage else 0
 
-    # One License ID may run on only one device at a time. A different device
-    # must be cleared by the administrator before it can be activated.
+    # Bind both persistent device ID and physical HDD serial. Any change requires an
+    # authenticated LMP-admin reset; never silently overwrite the existing binding.
+    if existing is not None and str(existing["hdd_id"] or "").strip() and str(existing["hdd_id"]).strip().casefold() != hdd.casefold():
+        conn.close(); return 409,{"ok":False,"error":"Hardware ID mismatch / License Invalid. Contact the License Administrator to Clear HWID.","reason":"hardware_mismatch","activation_count":used_count,"activation_limit":MAX_ACTIVATIONS}
     if existing is None and other is not None:
-        conn.close(); return 409,{"ok":False,"error":"license already active on another system; please contact the License Administrator","reason":"device_in_use","activation_count":used_count,"activation_limit":MAX_ACTIVATIONS}
+        conn.close(); return 409,{"ok":False,"error":"Hardware ID mismatch / License Invalid. Contact the License Administrator to Clear HWID.","reason":"hardware_mismatch","activation_count":used_count,"activation_limit":MAX_ACTIVATIONS}
 
     # Maximum three activation events between administrator limit resets.
     if existing is None and used_count >= MAX_ACTIVATIONS:
         conn.close(); return 409,{"ok":False,"error":"license activation limit reached (3 activations); please contact the License Administrator","reason":"activation_limit","activation_count":used_count,"activation_limit":MAX_ACTIVATIONS}
 
     if existing:
-        conn.execute("UPDATE activations SET last_seen=?,app_version=?,customer_name=?,status='ACTIVE',last_ip=?,expiry_date=?,license_count=? WHERE id=?",(now,version or None,customer or None,ip,expiry_date,license_count,existing["id"]))
+        conn.execute("UPDATE activations SET last_seen=?,app_version=?,customer_name=?,status='ACTIVE',last_ip=?,expiry_date=?,license_count=?,hdd_id=? WHERE id=?",(now,version or None,customer or None,ip,expiry_date,license_count,hdd,existing["id"]))
         activated_at=existing["activated_at"]
     else:
-        conn.execute("INSERT INTO activations(serial,client_code,customer_name,device_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(serial,decoded["client_code"],customer or None,device,now,now,version or None,"ACTIVE",license_count,expiry_date,ip,ip))
+        conn.execute("INSERT INTO activations(serial,client_code,customer_name,device_id,hdd_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(serial,decoded["client_code"],customer or None,device,hdd,now,now,version or None,"ACTIVE",license_count,expiry_date,ip,ip))
         conn.execute("INSERT INTO license_usage(serial,activation_count,last_device_id,updated_at) VALUES(?,?,?,?) ON CONFLICT(serial) DO UPDATE SET activation_count=license_usage.activation_count+1,last_device_id=excluded.last_device_id,updated_at=excluded.updated_at",(serial,1,device,now))
         activated_at=now; used_count += 1
     conn.commit(); conn.close()
-    result={"ok":True,"serial":serial,"status":"ACTIVE","activated_at":activated_at,"last_seen":now,"activation_count":used_count,"current_device_id":device,"expiry_date":expiry_date,"expiry_at":expiry_at,"license_count":license_count}
+    result={"ok":True,"serial":serial,"status":"ACTIVE","activated_at":activated_at,"last_seen":now,"activation_count":used_count,"current_device_id":device,"hdd_id":hdd,"hard_disk_serial":hdd,"expiry_date":expiry_date,"expiry_at":expiry_at,"license_count":license_count}
     for key in ("customer_name","product_name","issue_date","license_duration","client_code","renewal_date"):
         if meta.get(key): result[key]=meta[key]
     return 200,result
 
 def reset_activations(payload):
     serial=str(payload.get("serial","")).strip().upper().replace(" ","")
-    token=str(payload.get("admin_token","")).strip()
     mode=str(payload.get("mode","clear_device")).strip().lower()
-    if token != ADMIN_RESET_TOKEN:
-        return 403,{"ok":False,"error":"administrator authorization required"}
+    if mode not in ("clear_device", "reset_limit"):
+        return 400,{"ok":False,"error":"invalid reset mode"}
     if not serial:
         return 400,{"ok":False,"error":"serial is required"}
     if not decode_serial(serial):
         return 400,{"ok":False,"error":"invalid serial"}
     conn=db()
+    previous=conn.execute("SELECT device_id,hdd_id FROM activations WHERE serial=?",(serial,)).fetchall()
+    prior_devices=", ".join(str(x["device_id"] or "") for x in previous)
+    prior_hdds=", ".join(str(x["hdd_id"] or "") for x in previous)
+    reason=str(payload.get("reason") or "LMP administrator Clear HWID").strip()[:1000]
+    conn.execute("INSERT INTO hardware_reset_audit(serial,reason,reset_at,prior_device_ids,prior_hdd_ids) VALUES(?,?,?,?,?)",(serial,reason,utc_now(),prior_devices,prior_hdds))
     deleted=conn.execute("DELETE FROM activations WHERE serial=?",(serial,)).rowcount
-    if mode == "reset_limit":
-        conn.execute("DELETE FROM license_usage WHERE serial=?",(serial,))
-    else:
-        conn.execute("UPDATE license_usage SET last_device_id=NULL,updated_at=? WHERE serial=?",(utc_now(),serial))
+    # Clear HWID must allow reactivation on the replacement PC. Reset the
+    # activation counter only after recording the old hardware in the audit table.
+    conn.execute("DELETE FROM license_usage WHERE serial=?",(serial,))
     conn.commit()
     usage=conn.execute("SELECT activation_count FROM license_usage WHERE serial=?",(serial,)).fetchone()
     remaining=int(usage["activation_count"]) if usage else 0
     conn.close()
-    return 200,{"ok":True,"serial":serial,"reset":True,"mode":mode,"deleted_activations":int(deleted),"activation_count":remaining,"activation_limit":MAX_ACTIVATIONS}
+    return 200,{"ok":True,"serial":serial,"reset":True,"mode":mode,"deleted_activations":int(deleted),"activation_count":remaining,"activation_limit":MAX_ACTIVATIONS,"audit_recorded":True,"reason":reason}
 
 
 def status(serial):
@@ -457,7 +480,7 @@ def status(serial):
         return 403,{"ok":False,"error":"License has expired in License Management Pro","reason":"license_expired","expiry_at":expiry_at}
 
     conn=db()
-    rows=conn.execute("SELECT serial,client_code,customer_name,device_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip FROM activations WHERE serial=? ORDER BY id DESC",(serial,)).fetchall()
+    rows=conn.execute("SELECT serial,client_code,customer_name,device_id,hdd_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip FROM activations WHERE serial=? ORDER BY id DESC",(serial,)).fetchall()
     items=[merge_license_metadata(dict(r), serial) for r in rows]
     usage=conn.execute("SELECT activation_count FROM license_usage WHERE serial=?",(serial,)).fetchone()
     lifetime_count=int(usage["activation_count"]) if usage else 0
