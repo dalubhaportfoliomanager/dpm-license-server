@@ -406,7 +406,7 @@ def register(payload,ip):
     if license_count < 1: license_count=1
 
     existing=conn.execute("SELECT id,activated_at,hdd_id FROM activations WHERE serial=? AND device_id=?",(serial,device)).fetchone()
-    other=conn.execute("SELECT id,device_id,hdd_id FROM activations WHERE serial=? AND status='ACTIVE' ORDER BY id DESC LIMIT 1",(serial,device)).fetchone()
+    other=conn.execute("SELECT id,device_id,hdd_id FROM activations WHERE serial=? AND device_id<>? AND status='ACTIVE' ORDER BY id DESC LIMIT 1",(serial,device)).fetchone()
     usage=conn.execute("SELECT activation_count FROM license_usage WHERE serial=?",(serial,)).fetchone()
     used_count=int(usage["activation_count"]) if usage else 0
 
