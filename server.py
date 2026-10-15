@@ -304,9 +304,18 @@ def db():
     conn.commit(); return conn
 
 def respond(h,code,payload):
-    raw=json.dumps(payload).encode(); h.send_response(code)
-    h.send_header("Content-Type","application/json; charset=utf-8"); h.send_header("Content-Length",str(len(raw)))
-    h.send_header("Access-Control-Allow-Origin","*"); h.end_headers(); h.wfile.write(raw)
+    raw=json.dumps(payload).encode()
+    try:
+        h.send_response(code)
+        h.send_header("Content-Type","application/json; charset=utf-8")
+        h.send_header("Content-Length",str(len(raw)))
+        h.send_header("Access-Control-Allow-Origin","*")
+        h.end_headers()
+        h.wfile.write(raw)
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        # Client timed out or disconnected before the response was written.
+        # This is not a license-validation result and should not produce a traceback.
+        return
 
 def read_json(h):
     try: return json.loads(h.rfile.read(int(h.headers.get("Content-Length","0"))).decode("utf-8"))
@@ -332,7 +341,7 @@ def local_license_metadata(serial):
         finally:
             conn.close()
     except Exception as exc:
-        print(f"[lmp-metadata] mirror_read_failed error={type(exc).__name__}", flush=True)
+        print(f"[lmp-metadata] mirror_read_failed error={type(exc).__name__} detail={str(exc)[:240]!r}", flush=True)
 
     try:
         if os.path.exists(LICENSE_DB_PATH):
