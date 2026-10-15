@@ -251,11 +251,23 @@ def db():
         if not column:
             conn.execute("ALTER TABLE client_accounts ADD COLUMN credential_vault TEXT")
         # Additive migration: keep all existing activation/account rows intact.
-        try:
-            conn.execute("ALTER TABLE activations ADD COLUMN hdd_id TEXT NOT NULL DEFAULT ''")
-        except Exception as exc:
-            if "duplicate column" not in str(exc).lower() and "already exists" not in str(exc).lower():
-                raise
+        # IMPORTANT: db() is called for every HTTP request. Do not execute ALTER
+        # TABLE unconditionally here: PostgreSQL needs an AccessExclusiveLock,
+        # and concurrent requests otherwise queue behind repeated migrations.
+        # Check first; if the column is genuinely absent, serialize only that
+        # one-time migration and re-check after acquiring the transaction lock.
+        hdd_column = conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name='activations' AND column_name='hdd_id'"
+        ).fetchone()
+        if not hdd_column:
+            conn.execute("SELECT pg_advisory_xact_lock(761903221)")
+            hdd_column = conn.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='activations' AND column_name='hdd_id'"
+            ).fetchone()
+            if not hdd_column:
+                conn.execute("ALTER TABLE activations ADD COLUMN hdd_id TEXT NOT NULL DEFAULT ''")
         conn.commit()
         return conn
 
