@@ -391,6 +391,59 @@ def merge_license_metadata(item, serial):
     return merged
 
 
+def _duration_days(meta):
+    """Infer the purchased term without using the license issue date as its start."""
+    text = str(meta.get("license_duration") or "").strip().lower()
+    match = re.search(r"(\d+)\s*(year|yr|month|mon|day|week)s?", text)
+    if match:
+        amount = max(1, int(match.group(1)))
+        unit = match.group(2)
+        if unit in ("year", "yr"):
+            return amount * 365
+        if unit in ("month", "mon"):
+            return amount * 30
+        if unit == "week":
+            return amount * 7
+        return amount
+    # Backward-compatible fallback: infer the old term from issue/expiry dates.
+    issue = parse_license_datetime(str(meta.get("issue_date") or ""))
+    expiry = parse_license_datetime(str(meta.get("expiry_date") or ""))
+    if issue and expiry:
+        days = (expiry.astimezone(IST).date() - issue.astimezone(IST).date()).days
+        if days > 0:
+            return days
+    return None
+
+
+def _expiry_from_activation(meta, now_utc):
+    """Return a calendar expiry based on actual first online activation time."""
+    days = _duration_days(meta)
+    if not days:
+        return None
+    start_date = now_utc.astimezone(IST).date()
+    # Preserve the calendar term (e.g. 1 year => same calendar date next year).
+    text = str(meta.get("license_duration") or "").strip().lower()
+    match = re.search(r"(\d+)\s*(year|yr)s?", text)
+    if match:
+        years = int(match.group(1))
+        try:
+            expiry_date = start_date.replace(year=start_date.year + years)
+        except ValueError:  # Feb 29 in a non-leap target year
+            expiry_date = start_date.replace(year=start_date.year + years, day=28)
+    else:
+        match = re.search(r"(\d+)\s*(month|mon)s?", text)
+        if match:
+            months = int(match.group(1))
+            year = start_date.year + (start_date.month - 1 + months) // 12
+            month = (start_date.month - 1 + months) % 12 + 1
+            import calendar
+            expiry_date = start_date.replace(year=year, month=month, day=min(start_date.day, calendar.monthrange(year, month)[1]))
+        else:
+            from datetime import timedelta
+            expiry_date = start_date + timedelta(days=days)
+    return expiry_date.strftime("%d-%b-%Y")
+
+
 def register(payload,ip):
     serial=str(payload.get("serial","")).strip().upper(); device=str(payload.get("device_id","")).strip(); hdd=str(payload.get("hdd_id") or payload.get("hard_disk_serial") or payload.get("hdd_serial") or "").strip()
     customer=str(payload.get("customer_name","")).strip(); version=str(payload.get("app_version","")).strip()
@@ -414,15 +467,40 @@ def register(payload,ip):
     if lmp_status != "active":
         return 403,{"ok":False,"error":"License is not ACTIVE in License Management Pro","reason":"lmp_license_inactive","license_status":meta.get("status","")}
 
+    now_dt=datetime.now(timezone.utc).replace(microsecond=0)
+    now=now_dt.isoformat().replace("+00:00","Z")
+    # A generated/issued date must not consume the client's term. On the first
+    # successful online activation, anchor expiry to server time + purchased term.
+    probe=db()
+    try:
+        any_prior=probe.execute("SELECT 1 FROM activations WHERE serial=? LIMIT 1",(serial,)).fetchone()
+    finally:
+        probe.close()
+    first_online_activation = any_prior is None
     expiry_date=str(meta.get("expiry_date") or "").strip()
+    if first_online_activation:
+        activated_expiry = _expiry_from_activation(meta, now_dt)
+        if activated_expiry:
+            expiry_date = activated_expiry
+            meta["expiry_date"] = expiry_date
+            meta["activation_date"] = now_dt.astimezone(IST).strftime("%d-%b-%Y")
+            # Keep the server mirror authoritative so status checks use the
+            # activation-anchored expiry rather than the original issue date.
+            mirror_conn=db()
+            try:
+                mirror_conn.execute("UPDATE lmp_license_mirror SET expiry_date=?, activation_date=?, synced_at=? WHERE UPPER(TRIM(license_key))=?",
+                    (expiry_date,meta["activation_date"],now,serial))
+                mirror_conn.commit()
+            finally:
+                mirror_conn.close()
     expiry_at=expiry_iso(expiry_date)
     if not expiry_at:
-        return 403,{"ok":False,"error":"License has no valid expiry date in License Management Pro","reason":"invalid_lmp_expiry","expiry_date_received":str(meta.get("expiry_date") or "<empty>"),"build":BUILD_ID}
+        return 403,{"ok":False,"error":"License has no valid expiry date or duration in License Management Pro","reason":"invalid_lmp_expiry","expiry_date_received":str(meta.get("expiry_date") or "<empty>"),"build":BUILD_ID}
     expiry_dt=datetime.fromisoformat(expiry_at.replace("Z","+00:00"))
-    if expiry_dt <= datetime.now(timezone.utc):
-        return 403,{"ok":False,"error":"License has expired in License Management Pro","reason":"license_expired","expiry_at":expiry_at}
+    if expiry_dt <= now_dt:
+        return 403,{"ok":False,"error":"License has expired in License Management Pro. Please renew it first.","reason":"license_expired","expiry_at":expiry_at}
 
-    conn=db(); now=utc_now()
+    conn=db()
     license_count=int(meta.get("license_count") or decoded.get("license_count") or 1)
     if license_count < 1: license_count=1
 
@@ -492,6 +570,21 @@ def status(serial):
     lmp_status=str(meta.get("status") or "").strip().lower()
     if lmp_status != "active":
         return 403,{"ok":False,"error":"License is not ACTIVE in License Management Pro","reason":"lmp_license_inactive","license_status":meta.get("status","")}
+
+    # An issued license that has never been activated has no running validity.
+    # Do not treat its precomputed issue-date expiry as an expired client term.
+    pre_conn=db()
+    try:
+        pre_rows=pre_conn.execute("SELECT id,device_id,hdd_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip,serial,client_code,customer_name FROM activations WHERE serial=? ORDER BY id DESC",(serial,)).fetchall()
+        pre_usage=pre_conn.execute("SELECT activation_count FROM license_usage WHERE serial=?",(serial,)).fetchone()
+    finally:
+        pre_conn.close()
+    if not pre_rows:
+        result={"ok":True,"serial":serial,"registered":False,"activation_count":int(pre_usage["activation_count"]) if pre_usage else 0,"active_device_count":0,"activation_limit":MAX_ACTIVATIONS,"items":[],"expiry_at":"","expiry_date":"","status":"NOT ACTIVATED"}
+        for key in ("customer_name","product_name","issue_date","license_duration","client_code","license_count"):
+            if meta.get(key) not in (None, ""):
+                result[key]=meta[key]
+        return 200,result
 
     expiry_at=expiry_iso(meta.get("expiry_date"))
     if not expiry_at:
@@ -806,11 +899,27 @@ class Handler(BaseHTTPRequestHandler):
                     return respond(self, 200, {"ok": True, "operation": "delete", "license_key": serial})
                 try: count_value = max(1, int(float(payload.get("license_count") or 1)))
                 except (TypeError, ValueError): count_value = 1
+                incoming_expiry = _safe_text(payload.get("expiry_date"),100)
+                incoming_activation = _safe_text(payload.get("activation_date"),100)
+                incoming_renewal = _safe_text(payload.get("renewal_date"),100)
+                # A routine sync/backfill must not roll back a term already anchored
+                # to actual activation. Explicit renewal events are allowed to update it.
+                prior = conn.execute("SELECT expiry_date,activation_date FROM lmp_license_mirror WHERE license_key=?", (serial,)).fetchone()
+                if prior and prior[1] and not incoming_renewal:
+                    prior_expiry_at = expiry_iso(prior[0])
+                    incoming_expiry_at = expiry_iso(incoming_expiry)
+                    if prior_expiry_at and incoming_expiry_at:
+                        try:
+                            if datetime.fromisoformat(incoming_expiry_at.replace("Z","+00:00")) < datetime.fromisoformat(prior_expiry_at.replace("Z","+00:00")):
+                                incoming_expiry = prior[0]
+                                incoming_activation = prior[1]
+                        except ValueError:
+                            pass
                 values = (serial, _safe_text(payload.get("customer_name"),200), _safe_text(payload.get("product_name"),200),
-                    _safe_text(payload.get("issue_date"),100), _safe_text(payload.get("expiry_date"),100),
+                    _safe_text(payload.get("issue_date"),100), incoming_expiry,
                     _safe_text(payload.get("license_duration"),100), _safe_text(payload.get("client_code"),120),
-                    count_value, _safe_text(payload.get("status"),30), _safe_text(payload.get("activation_date"),100),
-                    _safe_text(payload.get("renewal_date"),100), _safe_text(payload.get("remark"),1000), utc_now())
+                    count_value, _safe_text(payload.get("status"),30), incoming_activation,
+                    incoming_renewal, _safe_text(payload.get("remark"),1000), utc_now())
                 conn.execute("""INSERT INTO lmp_license_mirror
                     (license_key,customer_name,product_name,issue_date,expiry_date,license_duration,client_code,
                      license_count,status,activation_date,renewal_date,remark,synced_at)
