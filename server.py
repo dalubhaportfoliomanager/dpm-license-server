@@ -477,6 +477,12 @@ def register(payload,ip):
     finally:
         probe.close()
     first_online_activation = any_prior is None
+    activation_mode = str(payload.get("activation_mode") or "login").strip().lower()
+    # Login/heartbeat is validation only. It must never silently create the
+    # first activation or start a new license term; only the explicit Activate
+    # action may do that.
+    if first_online_activation and activation_mode != "activate":
+        return 403,{"ok":False,"error":"License has not been activated yet. Activate the license first through the authorized activation flow.","reason":"license_not_activated"}
     expiry_date=str(meta.get("expiry_date") or "").strip()
     if first_online_activation:
         activated_expiry = _expiry_from_activation(meta, now_dt)
