@@ -930,7 +930,23 @@ class Handler(BaseHTTPRequestHandler):
                      license_count=excluded.license_count,status=excluded.status,activation_date=excluded.activation_date,
                      renewal_date=excluded.renewal_date,remark=excluded.remark,synced_at=excluded.synced_at""", values)
                 conn.commit()
-                return respond(self, 200, {"ok": True, "operation": "upsert", "license_key": serial})
+                # Return the exact metadata accepted by the central mirror so the
+                # LMP client can verify that the renewed expiry reached the server.
+                print(
+                    f"[lmp-sync] operation=upsert license_key={serial} "
+                    f"expiry_date={incoming_expiry!r} status={_safe_text(payload.get('status'),30)!r} "
+                    f"renewal_event={bool(incoming_renewal)}",
+                    flush=True,
+                )
+                return respond(self, 200, {
+                    "ok": True,
+                    "operation": "upsert",
+                    "license_key": serial,
+                    "expiry_date": incoming_expiry,
+                    "status": _safe_text(payload.get("status"),30),
+                    "renewal_applied": bool(incoming_renewal),
+                    "synced_at": utc_now(),
+                })
             finally: conn.close()
         if parsed.path == "/v1/lmp/licenses/reset-credentials":
             # Explicit LMP-admin initiated reset. Never return plaintext credentials.
