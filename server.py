@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-lmp-expiry-sync-verify-20261021-1"
+BUILD_ID="dpm-http502-dictrow-fix-20261021-1"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -905,14 +905,26 @@ class Handler(BaseHTTPRequestHandler):
                 # A routine sync/backfill must not roll back a term already anchored
                 # to actual activation. Explicit renewal events are allowed to update it.
                 prior = conn.execute("SELECT expiry_date,activation_date FROM lmp_license_mirror WHERE license_key=?", (serial,)).fetchone()
-                if prior and prior[1] and not incoming_renewal:
-                    prior_expiry_at = expiry_iso(prior[0])
+                # PostgreSQL uses dict_row; SQLite returns sqlite3.Row. Support both
+                # row shapes explicitly so the sync endpoint cannot crash with KeyError.
+                if prior:
+                    if hasattr(prior, "keys"):
+                        prior_expiry = prior["expiry_date"]
+                        prior_activation = prior["activation_date"]
+                    else:
+                        prior_expiry = prior[0]
+                        prior_activation = prior[1]
+                else:
+                    prior_expiry = None
+                    prior_activation = None
+                if prior_activation and not incoming_renewal:
+                    prior_expiry_at = expiry_iso(prior_expiry)
                     incoming_expiry_at = expiry_iso(incoming_expiry)
                     if prior_expiry_at and incoming_expiry_at:
                         try:
                             if datetime.fromisoformat(incoming_expiry_at.replace("Z","+00:00")) < datetime.fromisoformat(prior_expiry_at.replace("Z","+00:00")):
-                                incoming_expiry = prior[0]
-                                incoming_activation = prior[1]
+                                incoming_expiry = prior_expiry
+                                incoming_activation = prior_activation
                         except ValueError:
                             pass
                 values = (serial, _safe_text(payload.get("customer_name"),200), _safe_text(payload.get("product_name"),200),
