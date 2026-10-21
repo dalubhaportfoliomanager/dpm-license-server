@@ -930,11 +930,30 @@ class Handler(BaseHTTPRequestHandler):
                      license_count=excluded.license_count,status=excluded.status,activation_date=excluded.activation_date,
                      renewal_date=excluded.renewal_date,remark=excluded.remark,synced_at=excluded.synced_at""", values)
                 conn.commit()
-                # Return the exact metadata accepted by the central mirror so the
-                # LMP client can verify that the renewed expiry reached the server.
+                # Read back the persisted record. Never echo the request as proof
+                # of sync: activation/status reads this mirror as the authority.
+                saved = conn.execute(
+                    "SELECT expiry_date,status,renewal_date,synced_at FROM lmp_license_mirror WHERE license_key=?",
+                    (serial,),
+                ).fetchone()
+                if not saved:
+                    return respond(self, 500, {"ok": False, "error": "LMP mirror write could not be verified"})
+                saved_expiry, saved_status, saved_renewal, saved_synced_at = saved[0], saved[1], saved[2], saved[3]
+                if incoming_renewal and str(saved_expiry or "").strip() != str(incoming_expiry or "").strip():
+                    print(
+                        f"[lmp-sync] VERIFY_MISMATCH license_key={serial} "
+                        f"incoming_expiry={incoming_expiry!r} saved_expiry={saved_expiry!r} "
+                        f"incoming_renewal={incoming_renewal!r}",
+                        flush=True,
+                    )
+                    return respond(self, 409, {
+                        "ok": False, "error": "Central mirror did not persist the renewed expiry",
+                        "license_key": serial, "expiry_date": saved_expiry,
+                        "expected_expiry_date": incoming_expiry,
+                    })
                 print(
                     f"[lmp-sync] operation=upsert license_key={serial} "
-                    f"expiry_date={incoming_expiry!r} status={_safe_text(payload.get('status'),30)!r} "
+                    f"expiry_date={saved_expiry!r} status={saved_status!r} "
                     f"renewal_event={bool(incoming_renewal)}",
                     flush=True,
                 )
@@ -942,10 +961,11 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "operation": "upsert",
                     "license_key": serial,
-                    "expiry_date": incoming_expiry,
-                    "status": _safe_text(payload.get("status"),30),
-                    "renewal_applied": bool(incoming_renewal),
-                    "synced_at": utc_now(),
+                    "expiry_date": saved_expiry,
+                    "status": saved_status,
+                    "renewal_date": saved_renewal,
+                    "renewal_applied": bool(incoming_renewal and str(saved_renewal or "").strip() == str(incoming_renewal).strip()),
+                    "synced_at": saved_synced_at or utc_now(),
                 })
             finally: conn.close()
         if parsed.path == "/v1/lmp/licenses/reset-credentials":
