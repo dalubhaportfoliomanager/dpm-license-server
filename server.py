@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-lmp-credential-vault-20261013-1"
+BUILD_ID="dpm-lmp-expiry-sync-verify-20261021-1"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -498,7 +498,7 @@ def register(payload,ip):
         return 403,{"ok":False,"error":"License has no valid expiry date or duration in License Management Pro","reason":"invalid_lmp_expiry","expiry_date_received":str(meta.get("expiry_date") or "<empty>"),"build":BUILD_ID}
     expiry_dt=datetime.fromisoformat(expiry_at.replace("Z","+00:00"))
     if expiry_dt <= now_dt:
-        return 403,{"ok":False,"error":"License has expired in License Management Pro. Please renew it first.","reason":"license_expired","expiry_at":expiry_at}
+        return 403,{"ok":False,"error":"License has expired in License Management Pro. Please renew it first.","reason":"license_expired","expiry_at":expiry_at,"expiry_date_received":str(meta.get("expiry_date") or ""),"license_key":serial,"build":BUILD_ID}
 
     conn=db()
     license_count=int(meta.get("license_count") or decoded.get("license_count") or 1)
@@ -591,7 +591,7 @@ def status(serial):
         return 403,{"ok":False,"error":"License has no valid expiry date in License Management Pro","reason":"invalid_lmp_expiry","expiry_date_received":str(meta.get("expiry_date") or "<empty>"),"build":BUILD_ID}
 
     if datetime.fromisoformat(expiry_at.replace("Z","+00:00")) <= datetime.now(timezone.utc):
-        return 403,{"ok":False,"error":"License has expired in License Management Pro","reason":"license_expired","expiry_at":expiry_at}
+        return 403,{"ok":False,"error":"License has expired in License Management Pro","reason":"license_expired","expiry_at":expiry_at,"expiry_date_received":str(meta.get("expiry_date") or ""),"license_key":serial,"build":BUILD_ID}
 
     conn=db()
     rows=conn.execute("SELECT serial,client_code,customer_name,device_id,hdd_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip FROM activations WHERE serial=? ORDER BY id DESC",(serial,)).fetchall()
@@ -706,7 +706,7 @@ def save_client_signup(payload):
     if not expiry_at:
         return 403,{"ok":False,"error":"License expiry date is missing or invalid in License Management Pro.","reason":"invalid_lmp_expiry"}
     if datetime.fromisoformat(expiry_at.replace("Z","+00:00")) <= datetime.now(timezone.utc):
-        return 403,{"ok":False,"error":"This License has expired. Please use the existing account's Renew flow.","reason":"license_expired","expiry_at":expiry_at}
+        return 403,{"ok":False,"error":"This License has expired. Please use the existing account's Renew flow.","reason":"license_expired","expiry_at":expiry_at,"expiry_date_received":str(meta.get("expiry_date") or ""),"license_key":license_id,"build":BUILD_ID}
 
     now=utc_now(); conn=db()
     try:
@@ -930,31 +930,21 @@ class Handler(BaseHTTPRequestHandler):
                      license_count=excluded.license_count,status=excluded.status,activation_date=excluded.activation_date,
                      renewal_date=excluded.renewal_date,remark=excluded.remark,synced_at=excluded.synced_at""", values)
                 conn.commit()
-                # Read back the persisted record. Never echo the request as proof
-                # of sync: activation/status reads this mirror as the authority.
+                # Read back the committed row rather than echoing the request.
+                # This makes the response prove what the central DB actually stored.
                 saved = conn.execute(
                     "SELECT expiry_date,status,renewal_date,synced_at FROM lmp_license_mirror WHERE license_key=?",
                     (serial,),
                 ).fetchone()
                 if not saved:
-                    return respond(self, 500, {"ok": False, "error": "LMP mirror write could not be verified"})
-                saved_expiry, saved_status, saved_renewal, saved_synced_at = saved[0], saved[1], saved[2], saved[3]
-                if incoming_renewal and str(saved_expiry or "").strip() != str(incoming_expiry or "").strip():
-                    print(
-                        f"[lmp-sync] VERIFY_MISMATCH license_key={serial} "
-                        f"incoming_expiry={incoming_expiry!r} saved_expiry={saved_expiry!r} "
-                        f"incoming_renewal={incoming_renewal!r}",
-                        flush=True,
-                    )
-                    return respond(self, 409, {
-                        "ok": False, "error": "Central mirror did not persist the renewed expiry",
-                        "license_key": serial, "expiry_date": saved_expiry,
-                        "expected_expiry_date": incoming_expiry,
-                    })
+                    return respond(self, 500, {"ok": False, "error": "LMP sync row was not found after commit", "license_key": serial, "build": BUILD_ID})
+                saved_expiry = str(saved[0] or "")
+                saved_status = str(saved[1] or "")
+                saved_renewal = str(saved[2] or "")
                 print(
                     f"[lmp-sync] operation=upsert license_key={serial} "
-                    f"expiry_date={saved_expiry!r} status={saved_status!r} "
-                    f"renewal_event={bool(incoming_renewal)}",
+                    f"incoming_expiry={incoming_expiry!r} saved_expiry={saved_expiry!r} "
+                    f"status={saved_status!r} renewal_event={bool(incoming_renewal)} build={BUILD_ID}",
                     flush=True,
                 )
                 return respond(self, 200, {
@@ -963,9 +953,9 @@ class Handler(BaseHTTPRequestHandler):
                     "license_key": serial,
                     "expiry_date": saved_expiry,
                     "status": saved_status,
-                    "renewal_date": saved_renewal,
-                    "renewal_applied": bool(incoming_renewal and str(saved_renewal or "").strip() == str(incoming_renewal).strip()),
-                    "synced_at": saved_synced_at or utc_now(),
+                    "renewal_applied": bool(incoming_renewal and saved_renewal == incoming_renewal),
+                    "synced_at": str(saved[3] or utc_now()),
+                    "build": BUILD_ID,
                 })
             finally: conn.close()
         if parsed.path == "/v1/lmp/licenses/reset-credentials":
