@@ -539,17 +539,6 @@ def register(payload,ip):
         conn.execute("INSERT INTO activations(serial,client_code,customer_name,device_id,hdd_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(serial,decoded["client_code"],customer or None,device,hdd,now,now,version or None,"ACTIVE",license_count,expiry_date,ip,ip))
         conn.execute("INSERT INTO license_usage(serial,activation_count,last_device_id,updated_at) VALUES(?,?,?,?) ON CONFLICT(serial) DO UPDATE SET activation_count=license_usage.activation_count+1,last_device_id=excluded.last_device_id,updated_at=excluded.updated_at",(serial,1,device,now))
         activated_at=now; used_count += 1
-
-    # Only after all activation checks pass and the activation record is written,
-    # promote the central LMP mirror. Failed/blocked activation requests return
-    # above and therefore leave the LMP status Inactive. This prevents the DPM
-    # login from immediately re-triggering the inactive-license gate after the
-    # client has shown "License Verified".
-    if activation_mode == "activate":
-        conn.execute(
-            "UPDATE lmp_license_mirror SET status='Active', synced_at=? WHERE UPPER(TRIM(license_key))=?",
-            (now, serial),
-        )
     conn.commit(); conn.close()
     result={"ok":True,"serial":serial,"status":"ACTIVE","activated_at":activated_at,"last_seen":now,"activation_count":used_count,"current_device_id":device,"hdd_id":hdd,"hard_disk_serial":hdd,"expiry_date":expiry_date,"expiry_at":expiry_at,"license_count":license_count}
     for key in ("customer_name","product_name","issue_date","license_duration","client_code","renewal_date"):
@@ -927,17 +916,24 @@ class Handler(BaseHTTPRequestHandler):
                 incoming_renewal = _safe_text(payload.get("renewal_date"),100)
                 # A routine sync/backfill must not roll back a term already anchored
                 # to actual activation. Explicit renewal events are allowed to update it.
-                prior = conn.execute("SELECT expiry_date,activation_date FROM lmp_license_mirror WHERE license_key=?", (serial,)).fetchone()
+                prior = conn.execute("SELECT expiry_date,activation_date,renewal_date FROM lmp_license_mirror WHERE license_key=?", (serial,)).fetchone()
                 # PostgreSQL uses dict_row; SQLite may return tuple-like rows.
                 # Never index a dict row with [0]/[1] (that raises KeyError and
                 # turns the Render request into HTTP 502).
                 if isinstance(prior, dict):
                     prior_expiry = prior.get("expiry_date")
                     prior_activation = prior.get("activation_date")
+                    prior_renewal = prior.get("renewal_date")
                 else:
                     prior_expiry = prior[0] if prior is not None else None
                     prior_activation = prior[1] if prior is not None else None
-                if prior and prior_activation and not incoming_renewal:
+                    prior_renewal = prior[2] if prior is not None else None
+                # Routine LMP syncs often omit renewal_date. Keep the last
+                # confirmed renewal timestamp instead of erasing it with blank.
+                if not incoming_renewal and prior_renewal:
+                    incoming_renewal = str(prior_renewal).strip()
+                is_new_renewal = bool(incoming_renewal) and incoming_renewal != str(prior_renewal or '').strip()
+                if prior and prior_activation and not is_new_renewal:
                     prior_expiry_at = expiry_iso(prior_expiry)
                     incoming_expiry_at = expiry_iso(incoming_expiry)
                     if prior_expiry_at and incoming_expiry_at:
@@ -967,7 +963,7 @@ class Handler(BaseHTTPRequestHandler):
                 print(
                     f"[lmp-sync] operation=upsert license_key={serial} "
                     f"expiry_date={incoming_expiry!r} status={_safe_text(payload.get('status'),30)!r} "
-                    f"renewal_event={bool(incoming_renewal)}",
+                    f"renewal_event={is_new_renewal}",
                     flush=True,
                 )
                 return respond(self, 200, {
@@ -976,7 +972,8 @@ class Handler(BaseHTTPRequestHandler):
                     "license_key": serial,
                     "expiry_date": incoming_expiry,
                     "status": _safe_text(payload.get("status"),30),
-                    "renewal_applied": bool(incoming_renewal),
+                    "renewal_date": incoming_renewal,
+                    "renewal_applied": is_new_renewal,
                     "synced_at": utc_now(),
                 })
             finally: conn.close()
