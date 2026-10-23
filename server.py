@@ -914,6 +914,8 @@ class Handler(BaseHTTPRequestHandler):
                 incoming_expiry = _safe_text(payload.get("expiry_date"),100)
                 incoming_activation = _safe_text(payload.get("activation_date"),100)
                 incoming_renewal = _safe_text(payload.get("renewal_date"),100)
+                # Explicit LMP admin validity adjustments may shorten expiry; routine sync may not.
+                expiry_adjustment = payload.get("expiry_adjustment") is True
                 # A routine sync/backfill must not roll back a term already anchored
                 # to actual activation. Explicit renewal events are allowed to update it.
                 prior = conn.execute("SELECT expiry_date,activation_date,renewal_date FROM lmp_license_mirror WHERE license_key=?", (serial,)).fetchone()
@@ -928,12 +930,8 @@ class Handler(BaseHTTPRequestHandler):
                     prior_expiry = prior[0] if prior is not None else None
                     prior_activation = prior[1] if prior is not None else None
                     prior_renewal = prior[2] if prior is not None else None
-                # Routine LMP syncs often omit renewal_date. Keep the last
-                # confirmed renewal timestamp instead of erasing it with blank.
-                if not incoming_renewal and prior_renewal:
-                    incoming_renewal = str(prior_renewal).strip()
-                is_new_renewal = bool(incoming_renewal) and incoming_renewal != str(prior_renewal or '').strip()
-                if prior and prior_activation and not is_new_renewal:
+                stored_renewal = incoming_renewal or (str(prior_renewal).strip() if prior_renewal else "")
+                if prior and prior_activation and not incoming_renewal and not expiry_adjustment:
                     prior_expiry_at = expiry_iso(prior_expiry)
                     incoming_expiry_at = expiry_iso(incoming_expiry)
                     if prior_expiry_at and incoming_expiry_at:
@@ -947,7 +945,7 @@ class Handler(BaseHTTPRequestHandler):
                     _safe_text(payload.get("issue_date"),100), incoming_expiry,
                     _safe_text(payload.get("license_duration"),100), _safe_text(payload.get("client_code"),120),
                     count_value, _safe_text(payload.get("status"),30), incoming_activation,
-                    incoming_renewal, _safe_text(payload.get("remark"),1000), utc_now())
+                    stored_renewal, _safe_text(payload.get("remark"),1000), utc_now())
                 conn.execute("""INSERT INTO lmp_license_mirror
                     (license_key,customer_name,product_name,issue_date,expiry_date,license_duration,client_code,
                      license_count,status,activation_date,renewal_date,remark,synced_at)
@@ -963,7 +961,7 @@ class Handler(BaseHTTPRequestHandler):
                 print(
                     f"[lmp-sync] operation=upsert license_key={serial} "
                     f"expiry_date={incoming_expiry!r} status={_safe_text(payload.get('status'),30)!r} "
-                    f"renewal_event={is_new_renewal}",
+                    f"renewal_event={bool(incoming_renewal)}",
                     flush=True,
                 )
                 return respond(self, 200, {
@@ -972,8 +970,8 @@ class Handler(BaseHTTPRequestHandler):
                     "license_key": serial,
                     "expiry_date": incoming_expiry,
                     "status": _safe_text(payload.get("status"),30),
-                    "renewal_date": incoming_renewal,
-                    "renewal_applied": is_new_renewal,
+                    "renewal_applied": bool(incoming_renewal),
+                    "expiry_adjustment_applied": bool(expiry_adjustment),
                     "synced_at": utc_now(),
                 })
             finally: conn.close()
