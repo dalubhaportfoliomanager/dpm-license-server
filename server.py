@@ -3,11 +3,11 @@
 from __future__ import annotations
 import json, os, re, sqlite3, hashlib, secrets, hmac
 from cryptography.fernet import Fernet, InvalidToken
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
-BUILD_ID="dpm-lmp-credential-vault-20261026-v2"
+BUILD_ID="dpm-lmp-credential-vault-20261013-1"
 ISSUER_SALT="DPM-2026-LICENSE-V1"
 DB_PATH=os.environ.get("DPM_LICENSE_SERVER_DB","activation_server.db")
 DATABASE_URL=os.environ.get("DATABASE_URL", "").strip()
@@ -16,7 +16,8 @@ PORT=int(os.environ.get("PORT", os.environ.get("DPM_LICENSE_SERVER_PORT","9191")
 MAX_ACTIVATIONS=3
 ADMIN_RESET_TOKEN=os.environ.get("DPM_LICENSE_ADMIN_TOKEN","")
 LMP_SYNC_TOKEN=os.environ.get("DPM_LMP_SYNC_TOKEN", "").strip()
-
+# License Management Pro is the authoritative license database.
+# DPM and License Management Pro are sibling project folders.
 _DEFAULT_LMP_DB_PATH=os.path.abspath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..",
@@ -35,6 +36,8 @@ def parse_license_datetime(value):
     text=str(value or "").strip()
     if not text: return None
 
+    # GLOBAL: accept the canonical LMP/View License display separator.
+    # Example: "08-Oct-2026 | 10:15 AM".
     text=text.replace(" | ", " ").replace("|", " ").strip()
 
     candidates=(
@@ -47,7 +50,6 @@ def parse_license_datetime(value):
         "%d-%m-%Y %I:%M %p",
         "%d-%m-%Y %H:%M:%S",
         "%d-%m-%Y %H:%M",
-        "%d-%m-%Y",
         "%d/%m/%Y %I:%M:%S %p",
         "%d/%m/%Y %I:%M %p",
         "%d/%m/%Y %H:%M:%S",
@@ -75,15 +77,26 @@ def parse_license_datetime(value):
         return None
 
 def expiry_iso(value):
-    """Convert any LMP expiry value to UTC using the expiry calendar date."""
+    """Convert any LMP expiry value to UTC using the expiry calendar date.
+
+    GLOBAL RULE:
+    The license is valid through 11:59:59 PM IST on its expiry date,
+    regardless of the time stored in the LMP/View License value.
+    Example: "08-Oct-2026 | 10:15 AM" remains valid until
+    08-Oct-2026 11:59:59 PM IST.
+    """
     text = str(value or "").strip()
     if not text:
         return None
 
+    # Accept the canonical LMP/View License separator globally.
     text = text.replace(" | ", " ").replace("|", " ").strip()
 
     dt = parse_license_datetime(text)
     if dt is None:
+        # LMP has used several display/storage formats over time. If the time
+        # portion is unfamiliar (milliseconds, AM/PM suffix, etc.), recover the
+        # calendar date only; expiry policy is end-of-day IST anyway.
         date_patterns = (
             r"(?i)(\d{1,2})[- ]([A-Z]{3})[- ](\d{4})",
             r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})",
@@ -109,6 +122,8 @@ def expiry_iso(value):
             return None
         dt = recovered.replace(tzinfo=IST).astimezone(timezone.utc)
 
+    # parse_license_datetime returns UTC. Convert back to IST, keep only
+    # the calendar date, and make that date valid through 11:59:59 PM IST.
     ist_date = dt.astimezone(IST).date()
     expiry_ist = datetime(
         ist_date.year,
@@ -118,7 +133,6 @@ def expiry_iso(value):
         tzinfo=IST,
     )
     return expiry_ist.astimezone(timezone.utc).isoformat().replace("+00:00","Z")
-
 def fnv1a(v):
     h=0x811C9DC5
     for b in v.encode("utf-8"):
@@ -126,11 +140,11 @@ def fnv1a(v):
     return h
 
 def checksum(payload): return f"{fnv1a(f'{ISSUER_SALT}|{payload}'):08X}"
-
 def decode_serial(serial):
     """Decode both the current DMP...LMP##### format and legacy DPM1 keys."""
     serial=(serial or "").strip().upper().replace(" ","")
 
+    # Current format: DMP01OCT2026LMP00001
     m=re.fullmatch(r"DMP(\d{2})([A-Z]{3})(\d{4})LMP(\d{5})",serial)
     if m:
         day,mon,year,seq=m.groups()
@@ -148,6 +162,7 @@ def decode_serial(serial):
             "expiry_epoch":None,
         }
 
+    # Legacy format: DPM1-CLIENT-YYYYMMDD-COUNT-CHECKSUM
     p=serial.split("-")
     if len(p)!=5 or p[0]!="DPM1": return None
     client,date_text,count_text,check=p[1:]
@@ -166,6 +181,7 @@ def decode_serial(serial):
     return {"serial":serial,"client_code":client,"expiry_date":expiry.strftime("%Y-%m-%d"),"license_count":count,"expiry_epoch":expiry.timestamp()}
 
 class _PostgresConnection:
+    """Small compatibility adapter so existing SQL can use ? placeholders."""
     def __init__(self, raw):
         self.raw = raw
     def execute(self, sql, params=()):
@@ -176,6 +192,7 @@ class _PostgresConnection:
     def close(self): return self.raw.close()
 
 def get_client_account_count(conn):
+    """Return COUNT(*) correctly for both SQLite rows and psycopg dict rows."""
     row = conn.execute(
         "SELECT COUNT(*) AS account_count FROM client_accounts"
     ).fetchone()
@@ -186,6 +203,7 @@ def get_client_account_count(conn):
     except (TypeError, KeyError, IndexError):
         return int(row[0])
 
+
 def db():
     if DATABASE_URL:
         try:
@@ -195,6 +213,7 @@ def db():
             raise RuntimeError("DATABASE_URL is set but psycopg is not installed; add psycopg[binary] to requirements.txt") from exc
         raw=psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
         conn=_PostgresConnection(raw)
+        # PostgreSQL-compatible schema; account data persists in the managed database.
         conn.execute("""CREATE TABLE IF NOT EXISTS activations(
           id BIGSERIAL PRIMARY KEY, serial TEXT NOT NULL, client_code TEXT NOT NULL,
           customer_name TEXT, device_id TEXT NOT NULL, hdd_id TEXT NOT NULL DEFAULT '', activated_at TEXT NOT NULL, last_seen TEXT NOT NULL,
@@ -225,11 +244,18 @@ def db():
           issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
           license_count INTEGER NOT NULL DEFAULT 1, status TEXT, activation_date TEXT,
           renewal_date TEXT, remark TEXT, synced_at TEXT NOT NULL)""")
+        # Additive PostgreSQL migration; existing account rows remain untouched.
         column = conn.execute(
             "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='client_accounts' AND column_name='credential_vault'"
         ).fetchone()
         if not column:
             conn.execute("ALTER TABLE client_accounts ADD COLUMN credential_vault TEXT")
+        # Additive migration: keep all existing activation/account rows intact.
+        # IMPORTANT: db() is called for every HTTP request. Do not execute ALTER
+        # TABLE unconditionally here: PostgreSQL needs an AccessExclusiveLock,
+        # and concurrent requests otherwise queue behind repeated migrations.
+        # Check first; if the column is genuinely absent, serialize only that
+        # one-time migration and re-check after acquiring the transaction lock.
         hdd_column = conn.execute(
             "SELECT 1 FROM information_schema.columns "
             "WHERE table_schema=current_schema() AND table_name='activations' AND column_name='hdd_id'"
@@ -276,6 +302,7 @@ def db():
       issue_date TEXT, expiry_date TEXT, license_duration TEXT, client_code TEXT,
       license_count INTEGER NOT NULL DEFAULT 1, status TEXT, activation_date TEXT,
       renewal_date TEXT, remark TEXT, synced_at TEXT NOT NULL)""")
+    # Additive SQLite migration for existing central databases.
     try:
         conn.execute("ALTER TABLE client_accounts ADD COLUMN credential_vault TEXT")
     except sqlite3.OperationalError as exc:
@@ -298,6 +325,8 @@ def respond(h,code,payload):
         h.end_headers()
         h.wfile.write(raw)
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+        # Client timed out or disconnected before the response was written.
+        # This is not a license-validation result and should not produce a traceback.
         return
 
 def read_json(h):
@@ -305,6 +334,11 @@ def read_json(h):
     except Exception: return None
 
 def local_license_metadata(serial):
+    """Read latest authenticated LMP sync metadata first; use local LMP SQLite only as fallback.
+
+    The Render PostgreSQL mirror is refreshed by LMP sync. A stale SQLite copy
+    must not override newer expiry/status values already synced from LMP.
+    """
     serial = str(serial or "").strip().upper().replace(" ", "")
     try:
         conn = db()
@@ -350,10 +384,12 @@ def merge_license_metadata(item, serial):
     if not meta:
         return item
     merged=dict(item)
+    # License Management Pro is authoritative for license definition fields.
     for key in ("customer_name","product_name","issue_date","expiry_date","license_duration","client_code","license_count","renewal_date"):
         if meta.get(key) not in (None, ""):
             merged[key]=meta[key]
     return merged
+
 
 def _duration_days(meta):
     """Infer the purchased term without using the license issue date as its start."""
@@ -369,6 +405,7 @@ def _duration_days(meta):
         if unit == "week":
             return amount * 7
         return amount
+    # Backward-compatible fallback: infer the old term from issue/expiry dates.
     issue = parse_license_datetime(str(meta.get("issue_date") or ""))
     expiry = parse_license_datetime(str(meta.get("expiry_date") or ""))
     if issue and expiry:
@@ -377,19 +414,21 @@ def _duration_days(meta):
             return days
     return None
 
+
 def _expiry_from_activation(meta, now_utc):
-    """Return a calendar expiry based on actual online activation/renewal time."""
+    """Return a calendar expiry based on actual first online activation time."""
     days = _duration_days(meta)
     if not days:
         return None
     start_date = now_utc.astimezone(IST).date()
+    # Preserve the calendar term (e.g. 1 year => same calendar date next year).
     text = str(meta.get("license_duration") or "").strip().lower()
     match = re.search(r"(\d+)\s*(year|yr)s?", text)
     if match:
         years = int(match.group(1))
         try:
             expiry_date = start_date.replace(year=start_date.year + years)
-        except ValueError:
+        except ValueError:  # Feb 29 in a non-leap target year
             expiry_date = start_date.replace(year=start_date.year + years, day=28)
     else:
         match = re.search(r"(\d+)\s*(month|mon)s?", text)
@@ -400,18 +439,14 @@ def _expiry_from_activation(meta, now_utc):
             import calendar
             expiry_date = start_date.replace(year=year, month=month, day=min(start_date.day, calendar.monthrange(year, month)[1]))
         else:
+            from datetime import timedelta
             expiry_date = start_date + timedelta(days=days)
     return expiry_date.strftime("%d-%b-%Y")
 
-# =========================================================================
-# RULES 1 & 2: REGISTER & VALIDITY ENFORCEMENT
-# =========================================================================
-def register(payload, ip):
-    serial=str(payload.get("serial","")).strip().upper()
-    device=str(payload.get("device_id","")).strip()
-    hdd=str(payload.get("hdd_id") or payload.get("hard_disk_serial") or payload.get("hdd_serial") or "").strip()
-    customer=str(payload.get("customer_name","")).strip()
-    version=str(payload.get("app_version","")).strip()
+
+def register(payload,ip):
+    serial=str(payload.get("serial","")).strip().upper(); device=str(payload.get("device_id","")).strip(); hdd=str(payload.get("hdd_id") or payload.get("hard_disk_serial") or payload.get("hdd_serial") or "").strip()
+    customer=str(payload.get("customer_name","")).strip(); version=str(payload.get("app_version","")).strip()
     decoded=decode_serial(serial)
     meta=local_license_metadata(serial)
     if meta.get("customer_name"): customer=meta["customer_name"]
@@ -423,66 +458,56 @@ def register(payload, ip):
     if not hdd: return 400,{"ok":False,"error":"HDD serial could not be read; hardware binding cannot be verified","reason":"hdd_id_unavailable"}
     if not decoded: return 400,{"ok":False,"error":"invalid serial"}
 
+    # SECURITY RULE: a syntactically valid DMP...LMP##### string is NOT a license.
+    # The License ID must exist in the authoritative License Management Pro DB.
     if not meta:
         return 403,{"ok":False,"error":"License ID was not generated by License Management Pro","reason":"lmp_license_not_found"}
 
     lmp_status=str(meta.get("status") or "").strip().lower()
     activation_mode = str(payload.get("activation_mode") or "login").strip().lower()
+    # LMP deliberately keeps a renewed license Inactive until the client
+    # explicitly activates it. Permit only that explicit activation request;
+    # ordinary login/heartbeat requests must still reject inactive licenses.
     inactive_statuses = {"inactive", "deactive", "deactivated"}
+    if lmp_status != "active" and not (
+        lmp_status in inactive_statuses and activation_mode == "activate"
+    ):
+        return 403,{"ok":False,"error":"License is not ACTIVE in License Management Pro","reason":"lmp_license_inactive","license_status":meta.get("status","")}
 
     now_dt=datetime.now(timezone.utc).replace(microsecond=0)
     now=now_dt.isoformat().replace("+00:00","Z")
-
+    # A generated/issued date must not consume the client's term. On the first
+    # successful online activation, anchor expiry to server time + purchased term.
     probe=db()
     try:
-        prior_row=probe.execute("SELECT id, activated_at, expiry_date FROM activations WHERE serial=? LIMIT 1",(serial,)).fetchone()
+        any_prior=probe.execute("SELECT 1 FROM activations WHERE serial=? LIMIT 1",(serial,)).fetchone()
     finally:
         probe.close()
-
-    # Rule 1 & Rule 2: Determine if this is a first activation OR a renewed license awaiting activation
-    has_prior_activation = prior_row is not None
-    is_renewal_activation = lmp_status in inactive_statuses and (meta.get("renewal_date") or not meta.get("activation_date"))
-    is_first_activation = not has_prior_activation
-
-    # If license is Inactive, only explicit 'activate' request from DMP can activate it
-    if lmp_status != "active":
-        if lmp_status in inactive_statuses and activation_mode == "activate":
-            pass # Authorized to activate
-        else:
-            return 403,{"ok":False,"error":"License is not ACTIVE in License Management Pro. Please renew and activate it.","reason":"lmp_license_inactive","license_status":meta.get("status","")}
-
-    # Validation only (login mode): Must not silently start validity
-    if is_first_activation and activation_mode != "activate":
+    first_online_activation = any_prior is None
+    # Login/heartbeat is validation only. It must never silently create the
+    # first activation or start a new license term; only the explicit Activate
+    # action may do that.
+    if first_online_activation and activation_mode != "activate":
         return 403,{"ok":False,"error":"License has not been activated yet. Activate the license first through the authorized activation flow.","reason":"license_not_activated"}
-
     expiry_date=str(meta.get("expiry_date") or "").strip()
-
-    # RULES 1 & 2: Start validity ONLY when client triggers 'activate'
-    if (is_first_activation or is_renewal_activation) and activation_mode == "activate":
+    if first_online_activation:
         activated_expiry = _expiry_from_activation(meta, now_dt)
         if activated_expiry:
             expiry_date = activated_expiry
             meta["expiry_date"] = expiry_date
             meta["activation_date"] = now_dt.astimezone(IST).strftime("%d-%b-%Y")
-            meta["status"] = "Active"
-            
-            # Persist to central mirror; Next LMP sync will receive 'Active' status
+            # Keep the server mirror authoritative so status checks use the
+            # activation-anchored expiry rather than the original issue date.
             mirror_conn=db()
             try:
-                mirror_conn.execute(
-                    """UPDATE lmp_license_mirror 
-                       SET expiry_date=?, activation_date=?, status='Active', synced_at=? 
-                       WHERE UPPER(TRIM(license_key))=?""",
-                    (expiry_date, meta["activation_date"], now, serial)
-                )
+                mirror_conn.execute("UPDATE lmp_license_mirror SET expiry_date=?, activation_date=?, synced_at=? WHERE UPPER(TRIM(license_key))=?",
+                    (expiry_date,meta["activation_date"],now,serial))
                 mirror_conn.commit()
             finally:
                 mirror_conn.close()
-
     expiry_at=expiry_iso(expiry_date)
     if not expiry_at:
         return 403,{"ok":False,"error":"License has no valid expiry date or duration in License Management Pro","reason":"invalid_lmp_expiry","expiry_date_received":str(meta.get("expiry_date") or "<empty>"),"build":BUILD_ID}
-    
     expiry_dt=datetime.fromisoformat(expiry_at.replace("Z","+00:00"))
     if expiry_dt <= now_dt:
         return 403,{"ok":False,"error":"License has expired in License Management Pro. Please renew it first.","reason":"license_expired","expiry_at":expiry_at}
@@ -496,11 +521,14 @@ def register(payload, ip):
     usage=conn.execute("SELECT activation_count FROM license_usage WHERE serial=?",(serial,)).fetchone()
     used_count=int(usage["activation_count"]) if usage else 0
 
+    # Bind both persistent device ID and physical HDD serial. Any change requires an
+    # authenticated LMP-admin reset; never silently overwrite the existing binding.
     if existing is not None and str(existing["hdd_id"] or "").strip() and str(existing["hdd_id"]).strip().casefold() != hdd.casefold():
         conn.close(); return 409,{"ok":False,"error":"Hardware ID mismatch / License Invalid. Contact the License Administrator to Clear HWID.","reason":"hardware_mismatch","activation_count":used_count,"activation_limit":MAX_ACTIVATIONS}
     if existing is None and other is not None:
         conn.close(); return 409,{"ok":False,"error":"Hardware ID mismatch / License Invalid. Contact the License Administrator to Clear HWID.","reason":"hardware_mismatch","activation_count":used_count,"activation_limit":MAX_ACTIVATIONS}
 
+    # Maximum three activation events between administrator limit resets.
     if existing is None and used_count >= MAX_ACTIVATIONS:
         conn.close(); return 409,{"ok":False,"error":"license activation limit reached (3 activations); please contact the License Administrator","reason":"activation_limit","activation_count":used_count,"activation_limit":MAX_ACTIVATIONS}
 
@@ -512,7 +540,6 @@ def register(payload, ip):
         conn.execute("INSERT INTO license_usage(serial,activation_count,last_device_id,updated_at) VALUES(?,?,?,?) ON CONFLICT(serial) DO UPDATE SET activation_count=license_usage.activation_count+1,last_device_id=excluded.last_device_id,updated_at=excluded.updated_at",(serial,1,device,now))
         activated_at=now; used_count += 1
     conn.commit(); conn.close()
-    
     result={"ok":True,"serial":serial,"status":"ACTIVE","activated_at":activated_at,"last_seen":now,"activation_count":used_count,"current_device_id":device,"hdd_id":hdd,"hard_disk_serial":hdd,"expiry_date":expiry_date,"expiry_at":expiry_at,"license_count":license_count}
     for key in ("customer_name","product_name","issue_date","license_duration","client_code","renewal_date"):
         if meta.get(key): result[key]=meta[key]
@@ -534,12 +561,15 @@ def reset_activations(payload):
     reason=str(payload.get("reason") or "LMP administrator Clear HWID").strip()[:1000]
     conn.execute("INSERT INTO hardware_reset_audit(serial,reason,reset_at,prior_device_ids,prior_hdd_ids) VALUES(?,?,?,?,?)",(serial,reason,utc_now(),prior_devices,prior_hdds))
     deleted=conn.execute("DELETE FROM activations WHERE serial=?",(serial,)).rowcount
+    # Clear HWID must allow reactivation on the replacement PC. Reset the
+    # activation counter only after recording the old hardware in the audit table.
     conn.execute("DELETE FROM license_usage WHERE serial=?",(serial,))
     conn.commit()
     usage=conn.execute("SELECT activation_count FROM license_usage WHERE serial=?",(serial,)).fetchone()
     remaining=int(usage["activation_count"]) if usage else 0
     conn.close()
     return 200,{"ok":True,"serial":serial,"reset":True,"mode":mode,"deleted_activations":int(deleted),"activation_count":remaining,"activation_limit":MAX_ACTIVATIONS,"audit_recorded":True,"reason":reason}
+
 
 def status(serial):
     serial=(serial or "").strip().upper().replace(" ","")
@@ -553,6 +583,8 @@ def status(serial):
     if lmp_status != "active":
         return 403,{"ok":False,"error":"License is not ACTIVE in License Management Pro","reason":"lmp_license_inactive","license_status":meta.get("status","")}
 
+    # An issued license that has never been activated has no running validity.
+    # Do not treat its precomputed issue-date expiry as an expired client term.
     pre_conn=db()
     try:
         pre_rows=pre_conn.execute("SELECT id,device_id,hdd_id,activated_at,last_seen,app_version,status,license_count,expiry_date,first_ip,last_ip,serial,client_code,customer_name FROM activations WHERE serial=? ORDER BY id DESC",(serial,)).fetchall()
@@ -597,18 +629,28 @@ def _password_hash(value):
     return salt.hex()+":"+digest.hex()
 
 def _answers_hash(value):
+    # Store a salted hash of normalized answers; never store answers in clear text.
     normalized="|".join(str(x or "").strip().casefold() for x in (value if isinstance(value,list) else []))
     return _password_hash(normalized)
 
 def _credential_cipher():
+    """Load a Fernet key, also accepting a 64-character hex-encoded 32-byte secret.
+
+    Existing valid Fernet keys are used unchanged. A hex secret is decoded to
+    32 raw bytes and URL-safe-base64 encoded, yielding a deterministic Fernet key.
+    The secret itself is never logged or returned to clients.
+    """
     key = os.environ.get("DPM_CREDENTIAL_ENCRYPTION_KEY", "").strip()
     if not key:
         raise RuntimeError("DPM_CREDENTIAL_ENCRYPTION_KEY is not configured")
     try:
+        # Preserve compatibility with the standard Fernet format first.
         try:
             return Fernet(key.encode("ascii"))
         except (ValueError, UnicodeEncodeError):
             pass
+        # Render environment values are sometimes generated as `openssl rand -hex 32`.
+        # Support that representation without requiring users to replace the secret.
         if len(key) == 64 and re.fullmatch(r"[0-9a-fA-F]{64}", key):
             import base64
             raw = bytes.fromhex(key)
@@ -641,6 +683,11 @@ def _safe_text(value, limit=4000):
     return str(value or "").strip()[:limit]
 
 def save_client_signup(payload):
+    """Create one central account per username, email, and License ID.
+
+    Duplicate checks run inside a write transaction so concurrent requests cannot
+    register the same License ID twice. Existing rows are never deleted.
+    """
     username=_safe_text(payload.get("username"),120)
     email=_safe_text(payload.get("email"),254).lower()
     license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
@@ -652,12 +699,16 @@ def save_client_signup(payload):
     if not isinstance(answers,list) or len(answers)<3 or any(not str(x or "").strip() for x in answers[:3]):
         return 400,{"ok":False,"error":"three security answers are required","reason":"security_answers_required"}
 
+    # Future signup credentials must be recoverable for authorized LMP support.
+    # Refuse to create a new central record unless the encryption key is configured.
     try:
         _credential_cipher()
         encrypted_credentials = _encrypt_credentials(password, answers[:3])
     except Exception as exc:
         return 503,{"ok":False,"error":"Secure credential vault is not configured on the central server. Contact the administrator.","reason":"credential_vault_unavailable"}
 
+    # Never trust the client-provided License ID alone. LMP must be reachable
+    # and contain an active, unexpired license before new signup is accepted.
     meta=local_license_metadata(license_id)
     if not meta:
         return 403,{"ok":False,"error":"License ID could not be verified against License Management Pro. Check the server's LMP database connection.","reason":"lmp_license_not_found"}
@@ -671,6 +722,7 @@ def save_client_signup(payload):
 
     now=utc_now(); conn=db()
     try:
+        # IMMEDIATE serializes concurrent signup writers before duplicate checks.
         conn.execute("BEGIN IMMEDIATE")
         if conn.execute("SELECT 1 FROM client_accounts WHERE UPPER(TRIM(license_id))=? LIMIT 1",(license_id,)).fetchone():
             conn.rollback()
@@ -704,6 +756,7 @@ def save_client_signup(payload):
         conn.close()
 
 def import_local_account(payload):
+    """Restore an existing local DPM account. Admin-token protected; never overwrites."""
     username=_safe_text(payload.get("username"),120)
     email=_safe_text(payload.get("email"),254).lower()
     license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
@@ -748,6 +801,7 @@ def import_local_account(payload):
         conn.close()
 
 def save_client_log(payload):
+    # Deliberately reject common secret fields; logs must never receive passwords/answers.
     if any(k.lower() in {"password","confirm_password","secret_answers","secretanswers","token","api_key"} for k in payload):
         return 400,{"ok":False,"error":"sensitive fields are not accepted in logs"}
     license_id=_safe_text(payload.get("license_id") or payload.get("licenseId"),80).upper()
@@ -861,8 +915,12 @@ class Handler(BaseHTTPRequestHandler):
                 incoming_activation = _safe_text(payload.get("activation_date"),100)
                 incoming_renewal = _safe_text(payload.get("renewal_date"),100)
                 explicit_expiry_adjustment = bool(payload.get("expiry_adjustment"))
-                
+                # A routine sync/backfill must not roll back a term already anchored
+                # to actual activation. Explicit renewal events are allowed to update it.
                 prior = conn.execute("SELECT expiry_date,activation_date FROM lmp_license_mirror WHERE license_key=?", (serial,)).fetchone()
+                # PostgreSQL uses dict_row; SQLite may return tuple-like rows.
+                # Never index a dict row with [0]/[1] (that raises KeyError and
+                # turns the Render request into HTTP 502).
                 if isinstance(prior, dict):
                     prior_expiry = prior.get("expiry_date")
                     prior_activation = prior.get("activation_date")
@@ -894,6 +952,8 @@ class Handler(BaseHTTPRequestHandler):
                      license_count=excluded.license_count,status=excluded.status,activation_date=excluded.activation_date,
                      renewal_date=excluded.renewal_date,remark=excluded.remark,synced_at=excluded.synced_at""", values)
                 conn.commit()
+                # Return the exact metadata accepted by the central mirror so the
+                # LMP client can verify that the renewed expiry reached the server.
                 print(
                     f"[lmp-sync] operation=upsert license_key={serial} "
                     f"expiry_date={incoming_expiry!r} status={_safe_text(payload.get('status'),30)!r} "
@@ -911,6 +971,7 @@ class Handler(BaseHTTPRequestHandler):
                 })
             finally: conn.close()
         if parsed.path == "/v1/lmp/licenses/reset-credentials":
+            # Explicit LMP-admin initiated reset. Never return plaintext credentials.
             supplied = self.headers.get("X-DPM-LMP-Sync-Token", "")
             if not LMP_SYNC_TOKEN or not hmac.compare_digest(supplied, LMP_SYNC_TOKEN):
                 return respond(self, 401, {"ok": False, "error": "LMP authorization required"})
@@ -1005,17 +1066,20 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
         if parsed.path == "/v1/accounts/forgot-username":
+            # Exact registered-email lookup against the central account database.
+            # Do not expose account data beyond the username needed for recovery.
             email=_safe_text(payload.get("email"),254).strip().lower()
             if not email or "@" not in email:
                 return respond(self,400,{"ok":False,"error":"Enter a valid registered email address.","reason":"invalid_email"})
             conn=db()
             try:
+                # Diagnostic only: never log the email address or username.
                 row=conn.execute("SELECT username FROM client_accounts WHERE LOWER(TRIM(email))=? LIMIT 1",(email,)).fetchone()
                 account_count=get_client_account_count(conn)
                 if not row:
-                    print(f"[account-recovery] result=not_found db={('postgresql' if DATABASE_URL else os.path.abspath(DB_PATH))!r} central_account_count={account_count}", flush=True)
+                    print(f"[account-recovery] result=not_found db={("postgresql" if DATABASE_URL else os.path.abspath(DB_PATH))!r} central_account_count={account_count}", flush=True)
                     return respond(self,404,{"ok":False,"error":"No central account found with this email.","reason":"account_not_found"})
-                print(f"[account-recovery] result=found db={('postgresql' if DATABASE_URL else os.path.abspath(DB_PATH))!r} central_account_count={account_count}", flush=True)
+                print(f"[account-recovery] result=found db={("postgresql" if DATABASE_URL else os.path.abspath(DB_PATH))!r} central_account_count={account_count}", flush=True)
                 return respond(self,200,{"ok":True,"username":row["username"]})
             finally:
                 conn.close()
@@ -1029,7 +1093,11 @@ class Handler(BaseHTTPRequestHandler):
         return respond(self,404,{"ok":False,"error":"not found"})
 
 if __name__=="__main__":
+    # Bind the Render-assigned port before touching PostgreSQL. Render's health
+    # scanner must see a listening socket even if the database is temporarily slow.
     database_label=("PostgreSQL (DATABASE_URL configured)" if DATABASE_URL else os.path.abspath(DB_PATH))
     httpd=ThreadingHTTPServer((HOST,PORT),Handler)
     print(f"DPM License Tracker build={BUILD_ID} listening on http://{HOST}:{PORT}; database={database_label!r}; startup_db_check=deferred", flush=True)
+    # Do not block port binding on a database warm-up/count query. Individual
+    # database-backed requests still call db() and will log their actual errors.
     httpd.serve_forever()
