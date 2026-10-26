@@ -457,22 +457,20 @@ def register(payload, ip):
 
     expiry_date=str(meta.get("expiry_date") or "").strip()
 
-    # Start a brand-new term only on its first explicit activation.
-    # On renewal, LMP has already saved the new expiry date. Do not recompute
-    # it from license_duration: that field may be stale (for example "0 Days")
-    # and could overwrite a valid one-day renewal with an incorrect expiry.
+    # First activation starts a new term. Renewal activation MUST preserve
+    # the expiry already saved by LMP; license_duration may be stale (e.g. "0 Days").
     if activation_mode == "activate" and (is_first_activation or is_renewal_activation):
         if is_first_activation:
             activated_expiry = _expiry_from_activation(meta, now_dt)
             if activated_expiry:
                 expiry_date = activated_expiry
-        # Renewal activation must preserve the explicit LMP expiry date.
+        # For renewal, use the explicit expiry synchronized from LMP.
         if expiry_date:
             meta["expiry_date"] = expiry_date
             meta["activation_date"] = now_dt.astimezone(IST).strftime("%d-%b-%Y")
             meta["status"] = "Active"
 
-            # Save successful activation to the central mirror only.
+            # Persist successful explicit client activation centrally.
             mirror_conn = db()
             try:
                 mirror_conn.execute(
