@@ -457,23 +457,29 @@ def register(payload, ip):
 
     expiry_date=str(meta.get("expiry_date") or "").strip()
 
-    # RULES 1 & 2: Start validity ONLY when client triggers 'activate'
-    if (is_first_activation or is_renewal_activation) and activation_mode == "activate":
-        activated_expiry = _expiry_from_activation(meta, now_dt)
-        if activated_expiry:
-            expiry_date = activated_expiry
+    # Start a brand-new term only on its first explicit activation.
+    # On renewal, LMP has already saved the new expiry date. Do not recompute
+    # it from license_duration: that field may be stale (for example "0 Days")
+    # and could overwrite a valid one-day renewal with an incorrect expiry.
+    if activation_mode == "activate" and (is_first_activation or is_renewal_activation):
+        if is_first_activation:
+            activated_expiry = _expiry_from_activation(meta, now_dt)
+            if activated_expiry:
+                expiry_date = activated_expiry
+        # Renewal activation must preserve the explicit LMP expiry date.
+        if expiry_date:
             meta["expiry_date"] = expiry_date
             meta["activation_date"] = now_dt.astimezone(IST).strftime("%d-%b-%Y")
             meta["status"] = "Active"
-            
-            # Persist to central mirror; Next LMP sync will receive 'Active' status
-            mirror_conn=db()
+
+            # Save successful activation to the central mirror only.
+            mirror_conn = db()
             try:
                 mirror_conn.execute(
-                    """UPDATE lmp_license_mirror 
-                       SET expiry_date=?, activation_date=?, status='Active', synced_at=? 
+                    """UPDATE lmp_license_mirror
+                       SET expiry_date=?, activation_date=?, status='Active', synced_at=?
                        WHERE UPPER(TRIM(license_key))=?""",
-                    (expiry_date, meta["activation_date"], now, serial)
+                    (expiry_date, meta["activation_date"], now, serial),
                 )
                 mirror_conn.commit()
             finally:
